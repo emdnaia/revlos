@@ -2,17 +2,19 @@
 
 revlos is an RL-powered web login form brute-forcer
 
-What revlos CAN handle ✅:
+- What revlos CAN handle ✅:
 Server-side authentication (PHP, Python, Node.js backends)
 HTTP redirects (302, 301, 3xx)
 Server-side error messages
 Form-based POST/GET authentication
 
-What revlos CANNOT handle (yet) ❌:
+- What revlos CANNOT handle (yet) ❌:
 JavaScript-based authentication (like this site)
 Single Page Applications (SPAs) with JWT/token auth
 Sites requiring headless browsers
 
+- just a small POC: not planning any more work for now 
+  
 ## Installation
 
 ```bash
