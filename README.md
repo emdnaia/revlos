@@ -1,6 +1,6 @@
 # Description
 
-revlos is a rl based web login form bruteforcer
+revlos is an RL-powered web login form brute-forcer
 
 ## Installation
 
