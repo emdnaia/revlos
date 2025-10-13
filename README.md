@@ -13,7 +13,7 @@ JavaScript-based authentication (like this site)
 Single Page Applications (SPAs) with JWT/token auth
 Sites requiring headless browsers
 
-- just a small POC: not planning any more work for now 
+- Just a small POC: Not planning any more work (for now) 
   
 ## Installation
 
