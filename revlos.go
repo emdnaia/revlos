@@ -17,6 +17,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/chromedp/chromedp"
 )
 
 type Credential struct {
@@ -740,6 +742,68 @@ func loadWordlist(path string) ([]string, error) {
 	return words, scanner.Err()
 }
 
+// Headless browser authentication for JavaScript-based sites
+func attemptLoginHeadless(ctx context.Context, targetURL, userField, passField, username, password string, successIndicators map[string]string) (bool, time.Duration) {
+	start := time.Now()
+
+	// Create browser context with timeout
+	browserCtx, cancel := chromedp.NewContext(ctx, chromedp.WithLogf(func(string, ...interface{}) {}))
+	defer cancel()
+
+	timeoutCtx, timeoutCancel := context.WithTimeout(browserCtx, 15*time.Second)
+	defer timeoutCancel()
+
+	var finalURL string
+	var pageContent string
+
+	// Navigate, fill form, submit, and check result
+	err := chromedp.Run(timeoutCtx,
+		chromedp.Navigate(targetURL),
+		chromedp.WaitVisible(`input[name="`+userField+`"],input[id="`+userField+`"]`, chromedp.ByQuery),
+		chromedp.SendKeys(`input[name="`+userField+`"],input[id="`+userField+`"]`, username, chromedp.ByQuery),
+		chromedp.SendKeys(`input[name="`+passField+`"],input[id="`+passField+`"]`, password, chromedp.ByQuery),
+		chromedp.Click(`button[type="submit"],input[type="submit"],button[id="submit"]`, chromedp.ByQuery),
+		chromedp.Sleep(2*time.Second), // Wait for redirect/response
+		chromedp.Location(&finalURL),
+		chromedp.OuterHTML("html", &pageContent, chromedp.ByQuery),
+	)
+
+	elapsed := time.Since(start)
+
+	if err != nil {
+		return false, elapsed
+	}
+
+	// Check success indicators
+	// 1. URL contains success path
+	if successURL, ok := successIndicators["url"]; ok {
+		if strings.Contains(finalURL, successURL) {
+			return true, elapsed
+		}
+	}
+
+	// 2. Success text in page
+	if successText, ok := successIndicators["text"]; ok {
+		if strings.Contains(pageContent, successText) {
+			return true, elapsed
+		}
+	}
+
+	// 3. Failure text NOT in page
+	if failureText, ok := successIndicators["failure"]; ok {
+		if !strings.Contains(pageContent, failureText) {
+			return true, elapsed
+		}
+	}
+
+	// Default: check if URL changed significantly
+	if !strings.Contains(finalURL, "login") && finalURL != targetURL {
+		return true, elapsed
+	}
+
+	return false, elapsed
+}
+
 func main() {
 	rand.Seed(time.Now().UnixNano())
 
@@ -762,6 +826,7 @@ func main() {
 		anyRedirect    = flag.Bool("any-redirect", false, "Treat any redirect (3xx) as success")
 		method         = flag.String("method", "POST", "HTTP method (GET or POST)")
 		headers        = flag.String("header", "", "Custom headers (comma-separated, e.g., 'X-Forwarded-For:1.1.1.1,Referer:http://example.com')")
+		headless       = flag.Bool("headless", false, "Use headless browser for JavaScript-based authentication")
 	)
 
 	flag.Parse()
@@ -788,6 +853,7 @@ func main() {
 		fmt.Println("  --any-redirect    Treat any 3xx redirect as success")
 		fmt.Println("  --method <m>      HTTP method: GET or POST (default: POST)")
 		fmt.Println("  --header <h>      Custom headers (e.g., 'Referer:http://x.com,X-Forwarded-For:1.1.1.1')")
+		fmt.Println("  --headless        Use headless browser for JavaScript-based authentication")
 		fmt.Println("\nPositional arguments:")
 		fmt.Println("  <host>                Target host or IP")
 		fmt.Println("  http-post-form        Optional literal (can be omitted)")
@@ -805,11 +871,15 @@ func main() {
 	}
 
 	// Build initial target URL for auto-detection
-	scheme := "http"
-	if *port == 443 {
-		scheme = "https"
+	baseURL := targetHost
+	// If URL doesn't have a scheme, add one
+	if !strings.HasPrefix(targetHost, "http://") && !strings.HasPrefix(targetHost, "https://") {
+		scheme := "http"
+		if *port == 443 {
+			scheme = "https"
+		}
+		baseURL = fmt.Sprintf("%s://%s:%d", scheme, targetHost, *port)
 	}
-	baseURL := fmt.Sprintf("%s://%s:%d", scheme, targetHost, *port)
 
 	var path, params, failureString, userField, passField string
 
@@ -839,7 +909,11 @@ func main() {
 		}
 
 		// Detect error message
-		testURL := fmt.Sprintf("%s%s", baseURL, path)
+		// If baseURL already contains the path, don't append it again
+		testURL := baseURL
+		if !strings.Contains(baseURL, path) {
+			testURL = fmt.Sprintf("%s%s", baseURL, path)
+		}
 		// Use detected method or fall back to CLI flag
 		detectedMethod := detection.Method
 		if detectedMethod == "" {
@@ -907,7 +981,11 @@ func main() {
 		}
 	}
 
-	target := fmt.Sprintf("%s%s", baseURL, path)
+	// Build target URL (avoid double path if baseURL already contains it)
+	target := baseURL
+	if !strings.Contains(baseURL, path) && path != "" {
+		target = fmt.Sprintf("%s%s", baseURL, path)
+	}
 
 	// Parse custom headers
 	customHeaders := make(map[string]string)
@@ -1045,6 +1123,44 @@ func main() {
 						fmt.Printf("[ATTEMPT] %s:%s\n", cred.Username, cred.Password)
 					}
 
+					var success bool
+					var respTime time.Duration
+
+					// Use headless browser mode if enabled
+					if *headless {
+						successIndicators := make(map[string]string)
+						if *successText != "" {
+							successIndicators["text"] = *successText
+						}
+						if failureString != "" {
+							successIndicators["failure"] = failureString
+						}
+						successIndicators["url"] = "logged-in-successfully"
+
+						success, respTime = attemptLoginHeadless(ctx, target, userField, passField, cred.Username, cred.Password, successIndicators)
+						rl.learn(cred.Username, cred.Password, respTime, success)
+
+						if success {
+							select {
+							case found <- cred:
+								cancel()
+							default:
+							}
+							atomic.AddInt64(&attempts, 1)
+							mu.Lock()
+							processing--
+							mu.Unlock()
+							return
+						}
+
+						atomic.AddInt64(&attempts, 1)
+						mu.Lock()
+						processing--
+						mu.Unlock()
+						continue
+					}
+
+					// HTTP mode (original code)
 					attemptStart := time.Now()
 					data := url.Values{}
 					data.Set(userField, cred.Username)
@@ -1072,7 +1188,7 @@ func main() {
 					}
 
 					resp, err := client.Do(req)
-					respTime := time.Since(attemptStart)
+					respTime = time.Since(attemptStart)
 
 					if err == nil {
 						body, _ := io.ReadAll(resp.Body)
@@ -1080,7 +1196,7 @@ func main() {
 						bodyStr := string(body)
 
 						// Enhanced success detection with multiple strategies
-						success := false
+						success = false
 
 						// 1. Check custom success codes if specified
 						if len(successCodes) > 0 {
