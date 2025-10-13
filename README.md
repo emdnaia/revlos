@@ -12,7 +12,7 @@ go build -o revlos revlos.go
 # Quick Start
 
 ## Get Wordlists
-``
+```
 curl -O https://raw.githubusercontent.com/danielmiessler/SecLists/master/Usernames/top-usernames-shortlist.txt
 curl -O https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/2023-200_most_used_passwords.txt
 ```
