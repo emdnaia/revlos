@@ -1,57 +1,40 @@
-# Description
+# revlos - Intelligent Web Login Brute Forcer
 
-revlos is an RL-powered web login form brute-forcer
+**revlos** is an RL-powered (Reinforcement Learning) web login form brute-forcer attempt
 
-What revlos CAN handle ✅:
-- Server-side authentication (PHP, Python, Node.js backends)
-- JavaScript-based authentication (via --headless)
-- HTTP redirects (302, 301, 3xx)
-- Server-side error messages
-- Form-based POST/GET authentication
-- Client-side authentication requiring browser execution
+##  Installation
 
-What revlos CANNOT handle (yet) ❌:
-- Single Page Applications (SPAs) with JWT/token auth
-- Sites requiring complex browser interactions beyond form submission
-
-Just a small POC: Not planning any more work (for now)
-  
-## Installation
-
+### Quick Build
 ```bash
-
-go run revlos.go -L users.txt -P passwords.txt -f --auto 6.6.6.6
-
+# Clone or download revlos.go
 go build -o revlos revlos.go
-./revlos -L users.txt -P passwords.txt -f --auto 6.6.6.6
 
-```
-
-## Quick Start
-
-### Get Wordlists
-```
-curl -O https://raw.githubusercontent.com/danielmiessler/SecLists/master/Usernames/top-usernames-shortlist.txt
-curl -O https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/2023-200_most_used_passwords.txt
+# Or run directly
+go run revlos.go -L users.txt -P passwords.txt -f --auto target.com
 ```
 
-### Auto Mode (Easiest)
-```
-./revlos -L top-usernames-shortlist.txt -P 2023-200_most_used_passwords.txt -f --auto 6.6.6.6
-```
+This tool is for:
+- ✅ Authorized penetration testing
+- ✅ Security research with permission
+- ✅ Testing your own applications
+- ✅ Capture The Flag competitions
+- ✅ Educational purposes
 
-### Manual Mode (Hydra-compatible)
-```
-./revlos -L users.txt -P passwords.txt -f 6.6.6.6 -s 8080 \
-  http-post-form "/:username=^USER^&password=^PASS^:F=Invalid credentials"
-  ```
+Always:
+- Obtain written permission before testing
+- Respect rate limits and server resources
+- Follow responsible disclosure practices
+- Comply with local laws and regulations
 
-With Advanced Options
-```
-./revlos -L users.txt -P passwords.txt -f --auto \
-  --method POST \
-  --timeout 30 \
-  --any-redirect \
-  --header "Referer:http://6.6.6.6,X-Forwarded-For:127.0.0.1" \
-  6.6.6.6:8080
-  ```
+## POC only
+
+This is a Proof of Concept (POC) tool for educational and authorized security testing purposes only. Use only with permission.
+
+##  Credits
+
+- Built with Go and chromedp
+- RL algorithms inspired by multi-armed bandit research
+- Compatible with Hydra command-line syntax
+- Wordlists from SecLists by Daniel Miessler
+
+**Remember**: With great power comes great responsibility. Use wisely! ️
