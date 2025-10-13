@@ -11,6 +11,10 @@ go build -o revlos revlos.go
 
 # Quick Start
 
+# Description
+
+revlos is a rl based web login forms bruteforcer I needed
+
 ## Get Wordlists
 ```
 curl -O https://raw.githubusercontent.com/danielmiessler/SecLists/master/Usernames/top-usernames-shortlist.txt
