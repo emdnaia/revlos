@@ -12,6 +12,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -509,10 +510,24 @@ type FormDetection struct {
 	PasswordField string
 	ErrorMessage  string
 	Method        string
+	IsSPA         bool
+	SPAReason     string
 }
 
 func detectFormFields(targetURL string) (*FormDetection, error) {
-	resp, err := http.Get(targetURL)
+	// Create client with cookie jar to handle redirects properly
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{
+		Jar: jar,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("too many redirects")
+			}
+			return nil
+		},
+	}
+
+	resp, err := client.Get(targetURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch page: %v", err)
 	}
@@ -525,6 +540,11 @@ func detectFormFields(targetURL string) (*FormDetection, error) {
 		Path:   "/",
 		Method: "POST",
 	}
+
+	// Check if this is a SPA/JavaScript-heavy site
+	isSPA, spaReason := detectSPA(bodyStr)
+	detection.IsSPA = isSPA
+	detection.SPAReason = spaReason
 
 	// Parse URL path
 	parsedURL, _ := url.Parse(targetURL)
@@ -742,6 +762,76 @@ func loadWordlist(path string) ([]string, error) {
 	return words, scanner.Err()
 }
 
+// extractCSRF extracts CSRF token from HTML body by field name
+func extractCSRF(htmlBody, fieldName string) string {
+	// Try: <input ... name="CSRFToken" value="..." ...>
+	re := regexp.MustCompile(`<input[^>]*name="` + regexp.QuoteMeta(fieldName) + `"[^>]*value="([^"]+)"`)
+	if matches := re.FindStringSubmatch(htmlBody); len(matches) > 1 {
+		return matches[1]
+	}
+	// Try: <input ... value="..." ... name="CSRFToken" ...>
+	re = regexp.MustCompile(`<input[^>]*value="([^"]+)"[^>]*name="` + regexp.QuoteMeta(fieldName) + `"`)
+	if matches := re.FindStringSubmatch(htmlBody); len(matches) > 1 {
+		return matches[1]
+	}
+	// Try meta tag: <meta name="csrf-token" content="...">
+	re = regexp.MustCompile(`<meta[^>]*name="` + regexp.QuoteMeta(fieldName) + `"[^>]*content="([^"]+)"`)
+	if matches := re.FindStringSubmatch(htmlBody); len(matches) > 1 {
+		return matches[1]
+	}
+	return ""
+}
+
+// detectSPA checks if the target appears to be a Single-Page Application or JavaScript-heavy
+func detectSPA(htmlBody string) (bool, string) {
+	indicators := []struct {
+		pattern string
+		reason  string
+	}{
+		// JavaScript frameworks
+		{`react`, "React framework detected"},
+		{`vue`, "Vue framework detected"},
+		{`angular`, "Angular framework detected"},
+		{`ng-app`, "Angular app detected"},
+		{`data-reactroot`, "React root detected"},
+		{`__vue__`, "Vue instance detected"},
+		// AJAX patterns
+		{`XMLHttpRequest`, "XMLHttpRequest usage detected"},
+		{`fetch\(`, "Fetch API usage detected"},
+		{`axios`, "Axios HTTP client detected"},
+		{`$.ajax`, "jQuery AJAX detected"},
+		{`data-ajax`, "AJAX data attribute detected"},
+		{`no-ajax`, "AJAX marker detected"},
+		// Client-side routing
+		{`router`, "Client-side router detected"},
+		{`history.pushState`, "History API detected"},
+		{`#/`, "Hash-based routing detected"},
+		// Common SPA build artifacts
+		{`webpack`, "Webpack bundle detected"},
+		{`__webpack`, "Webpack runtime detected"},
+		{`/app.js`, "App bundle detected"},
+		{`/bundle.js`, "Bundle detected"},
+		{`/main.js`, "Main bundle detected"},
+		// Single Page indicators
+		{`single-page`, "Single-page application marker"},
+		{`spa-`, "SPA marker detected"},
+		{`data-base-target`, "Dynamic content container detected"},
+		{`data-ng-`, "Angular data binding detected"},
+		{`v-if`, "Vue.js directive detected"},
+		{`v-for`, "Vue.js list rendering detected"},
+	}
+
+	bodyLower := strings.ToLower(htmlBody)
+
+	for _, ind := range indicators {
+		if strings.Contains(bodyLower, ind.pattern) {
+			return true, ind.reason
+		}
+	}
+
+	return false, ""
+}
+
 // Headless browser authentication for JavaScript-based sites
 func attemptLoginHeadless(ctx context.Context, targetURL, userField, passField, username, password string, successIndicators map[string]string) (bool, time.Duration) {
 	start := time.Now()
@@ -775,9 +865,41 @@ func attemptLoginHeadless(ctx context.Context, targetURL, userField, passField, 
 	}
 
 	// Check success indicators
-	// 1. URL contains success path
+	pageContentLower := strings.ToLower(pageContent)
+	finalURLLower := strings.ToLower(finalURL)
+
+	// First check: If we're still on login page with password field, it's a failure
+	if strings.Contains(finalURLLower, "login") || strings.Contains(finalURLLower, "signin") || strings.Contains(finalURLLower, "auth") {
+		// Check if password field is still present
+		if strings.Contains(pageContentLower, `type="password"`) || strings.Contains(pageContentLower, `type='password'`) {
+			return false, elapsed
+		}
+	}
+
+	// Check for explicit failure indicators
+	if failureText, ok := successIndicators["failure"]; ok {
+		if strings.Contains(pageContent, failureText) {
+			return false, elapsed
+		}
+	}
+
+	// Check for common failure text
+	failureIndicators := []string{
+		"invalid credentials", "invalid username", "invalid password",
+		"incorrect password", "incorrect username", "login failed",
+		"authentication failed", "access denied", "wrong password",
+		"wrong username", "try again", "login error",
+	}
+	for _, indicator := range failureIndicators {
+		if strings.Contains(pageContentLower, indicator) {
+			return false, elapsed
+		}
+	}
+
+	// Positive success indicators
+	// 1. URL contains success path (specific paths like /dashboard, /account)
 	if successURL, ok := successIndicators["url"]; ok {
-		if strings.Contains(finalURL, successURL) {
+		if successURL != "logged-in-successfully" && strings.Contains(finalURL, successURL) {
 			return true, elapsed
 		}
 	}
@@ -789,18 +911,23 @@ func attemptLoginHeadless(ctx context.Context, targetURL, userField, passField, 
 		}
 	}
 
-	// 3. Failure text NOT in page
-	if failureText, ok := successIndicators["failure"]; ok {
-		if !strings.Contains(pageContent, failureText) {
+	// 3. Check for common success indicators
+	successPaths := []string{"/dashboard", "/account", "/home", "/portal", "/main", "/overview"}
+	for _, path := range successPaths {
+		if strings.Contains(finalURLLower, path) && !strings.Contains(pageContentLower, `type="password"`) {
 			return true, elapsed
 		}
 	}
 
-	// Default: check if URL changed significantly
-	if !strings.Contains(finalURL, "login") && finalURL != targetURL {
-		return true, elapsed
+	// 4. Logout button/link present (indicates we're logged in)
+	logoutIndicators := []string{"logout", "log out", "sign out", "signout"}
+	for _, indicator := range logoutIndicators {
+		if strings.Contains(pageContentLower, indicator) && !strings.Contains(pageContentLower, `type="password"`) {
+			return true, elapsed
+		}
 	}
 
+	// Default to failure if nothing definitive found
 	return false, elapsed
 }
 
@@ -853,7 +980,7 @@ func main() {
 		fmt.Println("  --any-redirect    Treat any 3xx redirect as success")
 		fmt.Println("  --method <m>      HTTP method: GET or POST (default: POST)")
 		fmt.Println("  --header <h>      Custom headers (e.g., 'Referer:http://x.com,X-Forwarded-For:1.1.1.1')")
-		fmt.Println("  --headless        Use headless browser for JavaScript-based authentication")
+		fmt.Println("  --headless        Use headless browser (--auto mode auto-switches if SPA detected)")
 		fmt.Println("\nPositional arguments:")
 		fmt.Println("  <host>                Target host or IP")
 		fmt.Println("  http-post-form        Optional literal (can be omitted)")
@@ -905,6 +1032,18 @@ func main() {
 			fmt.Printf("✓ Detected username field: %s\n", userField)
 			fmt.Printf("✓ Detected password field: %s\n", passField)
 			fmt.Printf("✓ Detected path: %s\n", path)
+
+			// Check if SPA detected and auto-switch
+			if detection.IsSPA {
+				fmt.Printf("⚠️  SPA/JavaScript detected: %s\n", detection.SPAReason)
+				if !*headless {
+					fmt.Println(" Auto-switching to headless mode for compatibility...")
+					*headless = true
+				} else {
+					fmt.Println("✓ Using headless mode (recommended for SPAs)")
+				}
+			}
+
 			fmt.Println(" Detecting error message...")
 		}
 
@@ -1048,15 +1187,59 @@ func main() {
 	}
 
 	var allCreds []Credential
+	// Strategy 1: Prioritize username==password combinations
+	matchingCreds := []Credential{}
+	// Strategy 2: Prioritize common passwords with all usernames
+	commonPasswordCreds := []Credential{}
+	otherCreds := []Credential{}
+
+	// Common passwords from real-world breaches (top 15)
+	commonPasswords := []string{
+		"password", "admin", "123456", "password123", "admin123",
+		"root", "test", "demo", "12345678", "123456789",
+		"Password1", "Admin123", "Test123", "qwerty", "letmein",
+	}
+
+	// Map for quick lookup
+	commonPassMap := make(map[string]bool)
+	for _, cp := range commonPasswords {
+		commonPassMap[cp] = true
+	}
+
 	for _, user := range usernames {
 		for _, pass := range passwords {
-			allCreds = append(allCreds, Credential{Username: user, Password: pass})
+			cred := Credential{Username: user, Password: pass}
+			if user == pass {
+				// Priority 1: Matching credentials
+				matchingCreds = append(matchingCreds, cred)
+			} else if commonPassMap[pass] {
+				// Priority 2: Common passwords
+				commonPasswordCreds = append(commonPasswordCreds, cred)
+			} else {
+				// Priority 3: Everything else
+				otherCreds = append(otherCreds, cred)
+			}
 		}
 	}
+
+	// Put high-priority credentials first
+	allCreds = append(matchingCreds, commonPasswordCreds...)
+	allCreds = append(allCreds, otherCreds...)
 	totalCreds := len(allCreds)
 
 	if !*quiet {
-		fmt.Printf(" Total combinations: %d\n", totalCreds)
+		priorityCount := len(matchingCreds) + len(commonPasswordCreds)
+		if priorityCount > 0 {
+			fmt.Printf(" Total combinations: %d (%d high-priority patterns prioritized)\n", totalCreds, priorityCount)
+			if len(matchingCreds) > 0 {
+				fmt.Printf("   ├─ %d matching username/password pairs\n", len(matchingCreds))
+			}
+			if len(commonPasswordCreds) > 0 {
+				fmt.Printf("   └─ %d common password combinations\n", len(commonPasswordCreds))
+			}
+		} else {
+			fmt.Printf(" Total combinations: %d\n", totalCreds)
+		}
 		fmt.Println(" Starting multi-algorithm adaptive attack...\n")
 	}
 
@@ -1140,6 +1323,19 @@ func main() {
 						success, respTime = attemptLoginHeadless(ctx, target, userField, passField, cred.Username, cred.Password, successIndicators)
 						rl.learn(cred.Username, cred.Password, respTime, success)
 
+						// Show progress in headless mode
+						currentAttempts := atomic.LoadInt64(&attempts) + 1
+						if !*quiet {
+							percentage := float64(currentAttempts) / float64(totalCreds) * 100
+							fmt.Printf("\r[%d/%d] (%.1f%%) Testing %s:%s - %s    ",
+								currentAttempts, totalCreds, percentage,
+								cred.Username, cred.Password,
+								map[bool]string{true: "✓ SUCCESS", false: "✗ Failed"}[success])
+							if success {
+								fmt.Println() // New line on success
+							}
+						}
+
 						if success {
 							select {
 							case found <- cred:
@@ -1165,6 +1361,21 @@ func main() {
 					data := url.Values{}
 					data.Set(userField, cred.Username)
 					data.Set(passField, cred.Password)
+
+					// Extract CSRF token if present
+					getResp, err := client.Get(target)
+					if err == nil {
+						getBody, _ := io.ReadAll(getResp.Body)
+						getResp.Body.Close()
+
+						// Try common CSRF field names
+						for _, csrfField := range []string{"CSRFToken", "csrf_token", "_csrf", "authenticity_token", "_token"} {
+							if token := extractCSRF(string(getBody), csrfField); token != "" {
+								data.Set(csrfField, token)
+								break
+							}
+						}
+					}
 
 					var req *http.Request
 					if httpMethod == "GET" {
@@ -1194,6 +1405,11 @@ func main() {
 						body, _ := io.ReadAll(resp.Body)
 						resp.Body.Close()
 						bodyStr := string(body)
+
+						if *verbose && len(bodyStr) == 0 {
+							fmt.Printf("[DEBUG] Empty body! Status: %d, Content-Length: %s, Content-Encoding: %s\n",
+								resp.StatusCode, resp.Header.Get("Content-Length"), resp.Header.Get("Content-Encoding"))
+						}
 
 						// Enhanced success detection with multiple strategies
 						success = false
@@ -1239,10 +1455,80 @@ func main() {
 						// 6. Check failure string (if present and no other success indicators)
 						if !success && failureString != "" {
 							// If failure string NOT found in response, it's a success
-							success = !strings.Contains(bodyStr, failureString)
+							hasFailure := strings.Contains(bodyStr, failureString)
+							success = !hasFailure
+							if *verbose && success {
+								fmt.Printf("[DEBUG] No failure string found for %s:%s\n", cred.Username, cred.Password)
+							}
 						}
 
-						// 7. Default: 200 OK is success (if no other rules matched)
+						// 7. IMPROVED: Verify success by checking if still on login page
+						if success {
+							if *verbose {
+								fmt.Printf("[DEBUG] Checking if still on login page for %s:%s (body length: %d)\n", cred.Username, cred.Password, len(bodyStr))
+								if len(bodyStr) > 200 {
+									fmt.Printf("[DEBUG] Body preview: %s...\n", bodyStr[:200])
+								}
+							}
+							// Check for login form indicators that suggest we're still on the login page
+							loginIndicators := []string{
+								fmt.Sprintf(`name="%s"`, userField),
+								fmt.Sprintf(`name="%s"`, passField),
+								`type="password"`,
+								`<title>Login</title>`,
+								`<title>Sign In</title>`,
+								`<title>Sign in</title>`,
+								`<title>Authentication</title>`,
+								`class="login`,
+								`id="login`,
+								`id="form_login`,
+							}
+
+							stillOnLoginPage := false
+
+							// First check: If it's a redirect back to the login page, it's a failure
+							if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+								location := resp.Header.Get("Location")
+								if location != "" {
+									loginPaths := []string{"/login", "/auth", "/signin", "/sign-in", "authentication"}
+									for _, path := range loginPaths {
+										if strings.Contains(strings.ToLower(location), path) {
+											stillOnLoginPage = true
+											if *verbose {
+												fmt.Printf("[DEBUG] Redirect back to login page: %s\n", location)
+											}
+											break
+										}
+									}
+								}
+							}
+
+							// Second check: If body has login form indicators (only if not already detected)
+							if !stillOnLoginPage {
+								for i, indicator := range loginIndicators {
+									if *verbose && i < 3 {
+										fmt.Printf("[DEBUG] Checking indicator %d: %s\n", i, indicator[:min(len(indicator), 40)])
+									}
+									if strings.Contains(bodyStr, indicator) {
+										stillOnLoginPage = true
+										if *verbose {
+											fmt.Printf("[DEBUG] Still on login page (found: %s)\n", indicator[:min(len(indicator), 30)])
+										}
+										break
+									}
+								}
+							}
+
+							// If we're still on the login page, it's a false positive
+							if stillOnLoginPage {
+								success = false
+								if *verbose {
+									fmt.Printf("[DEBUG] Marking as false positive for %s:%s\n", cred.Username, cred.Password)
+								}
+							}
+						}
+
+						// 8. Default: 200 OK is success (if no other rules matched)
 						if !success && len(successCodes) == 0 && !*anyRedirect && *successText == "" && *successCookie == "" && failureString == "" {
 							success = resp.StatusCode == 200
 						}
