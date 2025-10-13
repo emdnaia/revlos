@@ -1,4 +1,8 @@
-# Installation
+# Description
+
+revlos is a rl based web login form bruteforcer
+
+## Installation
 
 ```bash
 
@@ -9,24 +13,20 @@ go build -o revlos revlos.go
 
 ```
 
-# Quick Start
+## Quick Start
 
-# Description
-
-revlos is a rl based web login forms bruteforcer I needed
-
-## Get Wordlists
+### Get Wordlists
 ```
 curl -O https://raw.githubusercontent.com/danielmiessler/SecLists/master/Usernames/top-usernames-shortlist.txt
 curl -O https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/2023-200_most_used_passwords.txt
 ```
 
-Auto Mode (Easiest)
+### Auto Mode (Easiest)
 ```
 ./revlos -L top-usernames-shortlist.txt -P 2023-200_most_used_passwords.txt -f --auto 6.6.6.6
 ```
 
-Manual Mode (Hydra-compatible)
+### Manual Mode (Hydra-compatible)
 ```
 ./revlos -L users.txt -P passwords.txt -f 6.6.6.6 -s 8080 \
   http-post-form "/:username=^USER^&password=^PASS^:F=Invalid credentials"
