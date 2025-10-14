@@ -1,6 +1,6 @@
-# revlos - Intelligent Web Login Brute Forcer
+# revlos
 
-**revlos** is an RL-powered (Reinforcement Learning) web login form brute-forcer attempt
+**revlos** is a RL-powered web login form brute-forcer trying to beat Hydra at one single task
 
 ##  Installation
 
