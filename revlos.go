@@ -936,7 +936,9 @@ func main() {
 
 	// Hydra-compatible CLI parameters
 	var (
+		username       = flag.String("l", "", "Single username (literal)")
 		usernameList   = flag.String("L", "", "Username list file")
+		password       = flag.String("p", "", "Single password (literal)")
 		passwordList   = flag.String("P", "", "Password list file")
 		host           = flag.String("host", "", "Target host (or use positional argument)")
 		port           = flag.Int("s", 80, "Port number")
@@ -962,9 +964,11 @@ func main() {
 	args := flag.Args()
 	if len(args) < 1 {
 		fmt.Println("溺 revlos - Ultimate RL Brute Forcer")
-		fmt.Println("Usage: revlos -L userlist -P passlist -f host -s port [--auto | http-post-form \"spec\"]")
+		fmt.Println("Usage: revlos [-l user | -L userlist] [-p pass | -P passlist] -f host -s port [--auto | http-post-form \"spec\"]")
 		fmt.Println("\nHydra-compatible parameters:")
+		fmt.Println("  -l <user>     Single username (literal)")
 		fmt.Println("  -L <file>     Username list file or URL")
+		fmt.Println("  -p <pass>     Single password (literal)")
 		fmt.Println("  -P <file>     Password list file or URL")
 		fmt.Println("  -f            Stop on first valid credential")
 		fmt.Println("  -s <port>     Port (default: 80)")
@@ -1159,26 +1163,54 @@ func main() {
 		fmt.Println()
 	}
 
-	// Load wordlists
-	if *usernameList == "" || *passwordList == "" {
-		fmt.Println("❌ Error: -L (username list) and -P (password list) are required")
+	// Load wordlists or single credentials
+	var usernames, passwords []string
+	var err error
+
+	// Check for username input (-l or -L)
+	if *username != "" && *usernameList != "" {
+		fmt.Println("❌ Error: Cannot use both -l (single username) and -L (username list)")
+		os.Exit(1)
+	}
+	if *username == "" && *usernameList == "" {
+		fmt.Println("❌ Error: Either -l (username) or -L (username list) is required")
+		os.Exit(1)
+	}
+
+	// Check for password input (-p or -P)
+	if *password != "" && *passwordList != "" {
+		fmt.Println("❌ Error: Cannot use both -p (single password) and -P (password list)")
+		os.Exit(1)
+	}
+	if *password == "" && *passwordList == "" {
+		fmt.Println("❌ Error: Either -p (password) or -P (password list) is required")
 		os.Exit(1)
 	}
 
 	if !*quiet {
-		fmt.Println(" Loading wordlists...")
+		fmt.Println(" Loading credentials...")
 	}
 
-	usernames, err := loadWordlist(*usernameList)
-	if err != nil {
-		fmt.Printf("❌ Error loading username list: %v\n", err)
-		os.Exit(1)
+	// Load usernames
+	if *username != "" {
+		usernames = []string{*username}
+	} else {
+		usernames, err = loadWordlist(*usernameList)
+		if err != nil {
+			fmt.Printf("❌ Error loading username list: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
-	passwords, err := loadWordlist(*passwordList)
-	if err != nil {
-		fmt.Printf("❌ Error loading password list: %v\n", err)
-		os.Exit(1)
+	// Load passwords
+	if *password != "" {
+		passwords = []string{*password}
+	} else {
+		passwords, err = loadWordlist(*passwordList)
+		if err != nil {
+			fmt.Printf("❌ Error loading password list: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	if !*quiet {
