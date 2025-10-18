@@ -1013,6 +1013,7 @@ func main() {
 	}
 
 	var path, params, failureString, userField, passField string
+	var useBasicAuth bool
 
 	// Auto-detection mode
 	if *autoMode {
@@ -1021,8 +1022,30 @@ func main() {
 			fmt.Printf(" Fetching target: %s\n", baseURL)
 		}
 
-		// Detect form fields
-		detection, err := detectFormFields(baseURL)
+		// Check for HTTP Basic Auth first
+		testResp, err := http.Get(baseURL)
+		if err == nil {
+			defer testResp.Body.Close()
+			if testResp.StatusCode == 401 {
+				authHeader := testResp.Header.Get("WWW-Authenticate")
+				if strings.HasPrefix(authHeader, "Basic") {
+					useBasicAuth = true
+					if !*quiet {
+						fmt.Println(" Detected HTTP Basic Authentication")
+					}
+				}
+			}
+		}
+
+		// If Basic Auth, skip form detection
+		if useBasicAuth {
+			path = "/"
+			if !*quiet {
+				fmt.Println()
+			}
+		} else {
+			// Detect form fields
+			detection, err := detectFormFields(baseURL)
 		if err != nil {
 			fmt.Printf("❌ Auto-detection failed: %v\n", err)
 			os.Exit(1)
@@ -1074,7 +1097,7 @@ func main() {
 		}
 
 		params = fmt.Sprintf("%s=^USER^&%s=^PASS^", userField, passField)
-
+		}
 	} else {
 		// Manual mode - parse form spec
 		formSpec := ""
@@ -1390,39 +1413,49 @@ func main() {
 
 					// HTTP mode (original code)
 					attemptStart := time.Now()
-					data := url.Values{}
-					data.Set(userField, cred.Username)
-					data.Set(passField, cred.Password)
-
-					// Extract CSRF token if present
-					getResp, err := client.Get(target)
-					if err == nil {
-						getBody, _ := io.ReadAll(getResp.Body)
-						getResp.Body.Close()
-
-						// Try common CSRF field names
-						for _, csrfField := range []string{"CSRFToken", "csrf_token", "_csrf", "authenticity_token", "_token"} {
-							if token := extractCSRF(string(getBody), csrfField); token != "" {
-								data.Set(csrfField, token)
-								break
-							}
-						}
-					}
 
 					var req *http.Request
-					if httpMethod == "GET" {
-						// GET: Add parameters to URL
-						targetWithParams := target
-						if strings.Contains(target, "?") {
-							targetWithParams += "&" + data.Encode()
-						} else {
-							targetWithParams += "?" + data.Encode()
-						}
-						req, _ = http.NewRequestWithContext(ctx, "GET", targetWithParams, nil)
+
+					// Check if using Basic Auth
+					if useBasicAuth {
+						// Basic Auth: Simple GET request with Authorization header
+						req, _ = http.NewRequestWithContext(ctx, "GET", target, nil)
+						req.SetBasicAuth(cred.Username, cred.Password)
 					} else {
-						// POST: Send as form data
-						req, _ = http.NewRequestWithContext(ctx, "POST", target, strings.NewReader(data.Encode()))
-						req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+						// Form-based auth
+						data := url.Values{}
+						data.Set(userField, cred.Username)
+						data.Set(passField, cred.Password)
+
+						// Extract CSRF token if present
+						getResp, err := client.Get(target)
+						if err == nil {
+							getBody, _ := io.ReadAll(getResp.Body)
+							getResp.Body.Close()
+
+							// Try common CSRF field names
+							for _, csrfField := range []string{"CSRFToken", "csrf_token", "_csrf", "authenticity_token", "_token"} {
+								if token := extractCSRF(string(getBody), csrfField); token != "" {
+									data.Set(csrfField, token)
+									break
+								}
+							}
+						}
+
+						if httpMethod == "GET" {
+							// GET: Add parameters to URL
+							targetWithParams := target
+							if strings.Contains(target, "?") {
+								targetWithParams += "&" + data.Encode()
+							} else {
+								targetWithParams += "?" + data.Encode()
+							}
+							req, _ = http.NewRequestWithContext(ctx, "GET", targetWithParams, nil)
+						} else {
+							// POST: Send as form data
+							req, _ = http.NewRequestWithContext(ctx, "POST", target, strings.NewReader(data.Encode()))
+							req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+						}
 					}
 
 					// Add custom headers
@@ -1445,6 +1478,12 @@ func main() {
 
 						// Enhanced success detection with multiple strategies
 						success = false
+
+						// Basic Auth: 200 = success, 401 = failure
+						if useBasicAuth {
+							success = (resp.StatusCode == 200)
+						} else {
+							// Form-based authentication detection
 
 						// 1. Check custom success codes if specified
 						if len(successCodes) > 0 {
@@ -1564,6 +1603,7 @@ func main() {
 						if !success && len(successCodes) == 0 && !*anyRedirect && *successText == "" && *successCookie == "" && failureString == "" {
 							success = resp.StatusCode == 200
 						}
+						} // End of form-based detection
 
 						rl.learn(cred.Username, cred.Password, respTime, success)
 
