@@ -6,7 +6,14 @@
 
 ### Quick Build
 ```bash
-# Clone or download revlos.go
+# Get
+git clone https://github.com/emdnaia/revlos.git
+cd revlos
+# Initialize a Go module
+go mod init revlos
+# Download dependencies
+go mod tidy
+# Build
 go build -o revlos revlos.go
 
 # Or run directly
