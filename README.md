@@ -1,4 +1,5 @@
-## ? Quick Start
+Unauthorized access to computer systems is illegal. Always obtain written permission before testing. The authors assume no liability for misuse of this tool.
+
 
 ### **Installation**
 
