@@ -4,12 +4,16 @@ Unauthorized access to computer systems is illegal. Always obtain written permis
 ### **Installation**
 
 ```bash
-# Clone repository
+# Get
 git clone https://github.com/emdnaia/revlos.git
 cd revlos
-
+# Initialize a Go module
+go mod init revlos
+# Download dependencies
+go mod tidy
 # Build
 go build -o revlos revlos.go
+
 
 # Optional: Install dependencies for full features
 # Hashcat (for keyword password generation)
