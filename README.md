@@ -1,47 +1,125 @@
-# revlos
+## ? Quick Start
 
-**revlos** is a RL-powered web login form brute-forcer trying to beat Hydra at one single task
+### **Installation**
 
-##  Installation
-
-### Quick Build
 ```bash
-# Get
+# Clone repository
 git clone https://github.com/emdnaia/revlos.git
 cd revlos
-# Initialize a Go module
-go mod init revlos
-# Download dependencies
-go mod tidy
+
 # Build
 go build -o revlos revlos.go
 
-# Or run directly
-go run revlos.go -L users.txt -P passwords.txt -f --auto target.com
+# Optional: Install dependencies for full features
+# Hashcat (for keyword password generation)
+sudo apt install hashcat
+
+# CUPP (for personalized password generation)
+git clone https://github.com/Mebus/cupp.git
+
+# username-anarchy (for OSINT username generation)
+git clone https://github.com/urbanadventurer/username-anarchy.git
 ```
 
-This tool is for:
-- ✅ Authorized penetration testing
-- ✅ Security research with permission
-- ✅ Testing your own applications
-- ✅ Capture The Flag competitions
-- ✅ Educational purposes
+### **Basic Usage**
 
-Always:
-- Obtain written permission before testing
-- Respect rate limits and server resources
-- Follow responsible disclosure practices
-- Comply with local laws and regulations
+```bash
+# Auto-detection mode (recommended)
+./revlos --auto -L users.txt -P passwords.txt http://target.com
 
-## POC only
+# Manual mode with form specification
+./revlos -L users.txt -P passwords.txt \
+  http://target.com \
+  http-post-form "/login:username=^USER^&password=^PASS^:F=Invalid"
 
-This is a Proof of Concept (POC) tool for educational and authorized security testing purposes only. Use only with permission.
+# HTTP Basic Authentication
+./revlos --auto -L users.txt -P passwords.txt --basic-auth http://target.com
 
-##  Credits
+# Stop on first valid credential
+./revlos --auto -L users.txt -P passwords.txt -f http://target.com
 
-- Built with Go and chromedp
-- RL algorithms inspired by multi-armed bandit research
-- Compatible with Hydra command-line syntax
-- Wordlists from SecLists by Daniel Miessler
+# Headless mode for JavaScript/SPA sites
+./revlos --auto -L users.txt -P passwords.txt --headless http://target.com
+```
 
-**Remember**: With great power comes great responsibility. Use wisely! ️
+---
+
+## ? Usage Examples
+
+### **Web Application Login**
+```bash
+./revlos --auto -L usernames.txt -P rockyou.txt \
+  -f --timeout 15 http://example.com/login
+```
+
+### **Custom Success Detection**
+```bash
+./revlos -L users.txt -P passwords.txt \
+  --success-text "Welcome" \
+  --any-redirect \
+  http://target.com/auth
+```
+
+### **OSINT-Enhanced Attack**
+```bash
+./revlos --osint --auto -L users.txt -P passwords.txt \
+  --username-anarchy-path ./username-anarchy/username-anarchy \
+  http://corporate-site.com/login
+```
+
+### **Rate-Limited Target**
+```bash
+./revlos --auto -L users.txt -P passwords.txt \
+  -t 10 --timeout 30 \
+  http://slow-target.com
+```
+
+### **Single Credential Test**
+```bash
+./revlos -l admin -p Admin123 --auto http://target.com
+```
+
+
+### **Core Options**
+```
+-l <user>          Single username (literal)
+-L <file>          Username list file or URL
+-p <pass>          Single password (literal)
+-P <file>          Password list file or URL
+-f                 Stop on first valid credential
+-s <port>          Port (default: 80)
+-t <threads>       Parallel tasks (default: 100)
+-q                 Quiet mode
+-v                 Verbose mode
+```
+
+### **Auto-Detection**
+```
+--auto             Auto-detect form fields and error messages
+--headless         Use headless browser for JavaScript sites
+--basic-auth       Force HTTP Basic Authentication mode
+```
+
+### **Success Detection**
+```
+--success-text <s>    Text in response indicating success
+--success-cookie <c>  Cookie name indicating success
+--success-code <c>    HTTP status codes for success (e.g., 200,302)
+--any-redirect        Treat any 3xx redirect as success
+```
+
+### **Advanced Options**
+```
+--timeout <n>         Request timeout in seconds (default: 10)
+--max-time <n>        Maximum total time in seconds
+--method <m>          HTTP method: GET or POST (default: POST)
+--header <h>          Custom headers (comma-separated)
+--learning-rate <r>   RL learning rate 0.0-1.0 (default: 0.4)
+--batch-size <n>      Credentials per batch (default: 150)
+```
+
+### **OSINT Options**
+```
+--osint                      Enable OSINT intelligence gathering
+--username-anarchy-path <p>  Path to username-anarchy tool
+```
