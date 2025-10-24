@@ -190,7 +190,7 @@ go build -o cerebro cerebro.go
 
 #### SSH Attack with RL
 ```bash
-./cerebro -M ssh -h 83.136.249.47:48825 -u satwossh -P passwords.txt -t 8 -rl -f
+./cerebro -M ssh -h 1.1.1.1:2222 -u somebody -P passwords.txt -t 8 -rl -f
 # Result: Found satwossh:password1 in 5.26s (23 attempts)
 ```
 
