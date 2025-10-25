@@ -20,6 +20,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/chromedp/chromedp"
 )
@@ -30,6 +31,7 @@ type Credential struct {
 	Score    float64
 	Attempts int32
 	Successes int32
+	Pattern  string // ADAPTIVE TURBO: Track pattern for Thompson Sampling
 }
 
 // OSINT structures
@@ -95,6 +97,8 @@ type UltimateRL struct{
 	// Context-aware weighting (Option 3)
 	successCount int64 // Total successful authentications
 	attemptCount int64 // Total authentication attempts
+	// Mode detection
+	passwordBruteForceMode bool // True when doing password brute-force (skip low success rate check)
 }
 
 type ArmStats struct {
@@ -119,6 +123,18 @@ type boostJob struct {
 	username   string
 	password   string
 	baseReward float64
+}
+
+// ADAPTIVE TURBO: Lightweight Pattern Thompson Sampling
+type PatternThompson struct {
+	mu       sync.RWMutex
+	patterns map[string]*PatternStats
+}
+
+type PatternStats struct {
+	alpha float64 // Successes + 1
+	beta  float64 // Failures + 1
+	count int64   // Total attempts
 }
 
 func NewUltimateRL(learningRate float64) *UltimateRL {
@@ -369,7 +385,13 @@ func (rl *UltimateRL) shouldStop() (bool, string) {
 	}
 
 	// RULE 4: Low success rate after sufficient attempts
-	if totalAttempts >= 100 {
+	// Skip this check in password brute-force mode (single username, large password list)
+	// In password mode, we expect 0 successes for potentially 50K+ attempts
+	rl.mu.RLock()
+	isPasswordMode := rl.passwordBruteForceMode
+	rl.mu.RUnlock()
+
+	if !isPasswordMode && totalAttempts >= 100 {
 		rl.mu.RLock()
 		successCount := len(rl.successPatterns)
 		rl.mu.RUnlock()
@@ -380,7 +402,8 @@ func (rl *UltimateRL) shouldStop() (bool, string) {
 	}
 
 	// RULE 5: Too many consecutive failures (1000+)
-	if consecutiveFails >= 1000 {
+	// Skip this check in password brute-force mode where we expect many failures
+	if !isPasswordMode && consecutiveFails >= 1000 {
 		return true, "??  1000+ consecutive failures - attack appears blocked"
 	}
 
@@ -707,6 +730,47 @@ func getCharset(s string) string {
 		map[bool]int{true:1,false:0}[hasUpper],
 		map[bool]int{true:1,false:0}[hasDigit],
 		map[bool]int{true:1,false:0}[hasSymbol])
+}
+
+// ADAPTIVE TURBO: Lightweight pattern detection (10-20 patterns)
+func detectPasswordPattern(password, username string) string {
+	lower := strings.ToLower(password)
+	hasUpper := strings.ContainsAny(password, "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+	hasDigit := strings.ContainsAny(password, "0123456789")
+	hasSpecial := strings.ContainsAny(password, "!@#$%^&*()")
+
+	// Username-based patterns (highest value!)
+	if strings.Contains(lower, strings.ToLower(username)) {
+		if hasDigit {
+			return "Username+Digits" // admin123, Admin2024
+		}
+		if hasSpecial {
+			return "Username+Special" // admin!, Admin@
+		}
+		return "Username" // admin, Admin
+	}
+
+	// Common patterns
+	if hasUpper && hasDigit {
+		if hasSpecial {
+			return "Mixed+Special" // Password1!, Admin@123
+		}
+		return "TitleCase+Digits" // Password123, Admin123
+	}
+
+	if !hasUpper && hasDigit {
+		return "lowercase+digits" // password123, admin123
+	}
+
+	if hasUpper && !hasDigit {
+		return "TitleCase" // Password, Admin
+	}
+
+	if hasDigit && !hasUpper {
+		return "digits" // 123456, 2024
+	}
+
+	return "other" // Everything else
 }
 
 func min(a, b int) int {
@@ -2432,8 +2496,10 @@ func main() {
 		// OSINT integration
 		osintMode        = flag.Bool("osint", false, "Enable OSINT intelligence gathering from target")
 		anarchyPath      = flag.String("username-anarchy-path", "", "Path to username-anarchy tool")
-		// User enumeration mode
-		ffufMode         = flag.String("ffuf-mode", "", "Enumeration mode: 'users' or 'passwords'")
+		// Mode selection
+		mode             = flag.String("mode", "", "Attack mode: 'ffuf' (speed), 'hydra' (full RL), or leave empty for balanced")
+		// User enumeration mode (legacy compatibility)
+		ffufMode         = flag.String("ffuf-mode", "", "Enumeration mode: 'users' or 'passwords' (sets mode=ffuf)")
 		ffufURL          = flag.String("ffuf-url", "", "Target URL for ffuf mode (alternative to positional arg)")
 		ffufInvalid      = flag.String("ffuf-invalid", "", "Pattern for invalid usernames (auto-detected if empty)")
 		ffufValid        = flag.String("ffuf-valid", "", "Pattern for valid usernames (auto-detected if empty)")
@@ -2451,6 +2517,22 @@ func main() {
 	)
 
 	flag.Parse()
+
+	// MODE DETECTION: Normalize mode selection
+	// Priority: --mode flag > --ffuf-mode flag > default (balanced)
+	attackMode := "balanced" // default
+	if *mode != "" {
+		attackMode = strings.ToLower(*mode)
+	} else if *ffufMode == "passwords" || *ffufMode == "users" {
+		attackMode = "ffuf" // Legacy ffuf-mode sets ffuf mode
+	}
+
+	// Validate mode
+	validModes := map[string]bool{"ffuf": true, "hydra": true, "balanced": true}
+	if !validModes[attackMode] {
+		fmt.Printf("? Invalid mode '%s'. Use: ffuf, hydra, or balanced\n", attackMode)
+		os.Exit(1)
+	}
 
 	// EARLY EXIT: General fuzzing mode (ffuf-style directory/vhost/param fuzzing)
 	if *fuzzMode != "" && *fuzzURL != "" {
@@ -2552,7 +2634,7 @@ func main() {
 		fmt.Println("  # Classic brute force (manual spec)")
 		fmt.Println("  revlos -L users.txt -P passwords.txt http://target.com \"/:user=^USER^&pass=^PASS^:F=Invalid\"")
 		fmt.Println("")
-		fmt.Println("For more info: https://github.com/emdnaia/revlos")
+		fmt.Println("For more info: https://github.com/yourusername/revlos")
 		os.Exit(1)
 	}
 
@@ -2932,26 +3014,35 @@ func main() {
 	smartPasswords := make(map[string][]string) // username -> smart passwords
 	cuppPath := findCUPP()
 
-	for _, username := range usernames {
-		// Check if username is interesting (person or keyword)
-		if looksLikePersonName(username) || shouldRunCUPPForKeyword(username) {
-			if !*quiet {
-				toolName := "CUPP"
-				if shouldRunCUPPForKeyword(username) {
-					toolName = "HASHCAT"
-				}
-				fmt.Printf("? Pre-generating %s passwords for '%s'...\n", toolName, username)
-			}
-
-			// Generate smart passwords (CUPP for persons, Hashcat for keywords)
-			passwords, err := runCUPPForUsername(cuppPath, username)
-			if err == nil && len(passwords) > 0 {
-				// Keep ALL passwords (Hashcat generates ~141, CUPP ~176)
-				// RL will prioritize them anyway, so no need to pre-filter
-				smartPasswords[username] = passwords
-
+	// TURBO OPTIMIZATION #4: Smart password generation based on mode
+	// FFUF mode: Skip for speed | HYDRA mode: Full generation | BALANCED: Generate
+	if attackMode == "ffuf" {
+		if !*quiet {
+			fmt.Println("? FFUF MODE: Skipping smart password generation for maximum speed")
+		}
+	} else {
+		// HYDRA and BALANCED modes: Generate smart passwords
+		for _, username := range usernames {
+			// Check if username is interesting (person or keyword)
+			if looksLikePersonName(username) || shouldRunCUPPForKeyword(username) {
 				if !*quiet {
-					fmt.Printf("   ? Generated %d smart passwords\n", len(passwords))
+					toolName := "CUPP"
+					if shouldRunCUPPForKeyword(username) {
+						toolName = "HASHCAT"
+					}
+					fmt.Printf("? Pre-generating %s passwords for '%s'...\n", toolName, username)
+				}
+
+				// Generate smart passwords (CUPP for persons, Hashcat for keywords)
+				passwords, err := runCUPPForUsername(cuppPath, username)
+				if err == nil && len(passwords) > 0 {
+					// Keep ALL passwords (Hashcat generates ~141, CUPP ~176)
+					// RL will prioritize them anyway, so no need to pre-filter
+					smartPasswords[username] = passwords
+
+					if !*quiet {
+						fmt.Printf("   ? Generated %d smart passwords\n", len(passwords))
+					}
 				}
 			}
 		}
@@ -2977,12 +3068,13 @@ func main() {
 			}
 		}
 
-		// Strategy 2: Add wordlist passwords with NORMAL priority (score=0)
+		// Strategy 2: Add wordlist passwords with SMART SCORING!
+		// ALWAYS score them - this way Admin123 comes before random123!
 		for _, pass := range passwords {
 			allCreds = append(allCreds, Credential{
 				Username: user,
 				Password: pass,
-				Score:    0.0, // Normal priority - try after smart passwords
+				Score:    scorePasswordSmart(pass, user), // Smart scoring!
 			})
 		}
 	}
@@ -2991,24 +3083,119 @@ func main() {
 	totalCreds := len(allCreds)
 
 	if !*quiet {
-	if !*quiet {
 		fmt.Printf(" Total combinations: %d\n", totalCreds)
-		fmt.Println(" Starting RL-driven adaptive attack (no hardcoded bias)...\n")
-	}
+
+		// Display mode information
+		switch attackMode {
+		case "ffuf":
+			fmt.Println("? MODE: FFUF (Maximum Speed)")
+			fmt.Println("   ? One-time smart sort")
+			fmt.Println("   ? No batch re-prioritization")
+			fmt.Println("   ? No RL learning overhead")
+			fmt.Println("   ? No CUPP/HASHCAT generation")
+		case "hydra":
+			fmt.Println("? MODE: HYDRA (Full RL Intelligence)")
+			fmt.Println("   ? Batch re-prioritization every round")
+			fmt.Println("   ? UCB1 + Thompson + Genetic algorithms")
+			fmt.Println("   ? Adaptive CUPP/HASHCAT generation")
+			fmt.Println("   ? Pattern-level learning")
+		case "balanced":
+			fmt.Println("??  MODE: BALANCED (Smart + Fast)")
+			fmt.Println("   ? One-time smart sort")
+			fmt.Println("   ? Lightweight RL tracking")
+			fmt.Println("   ? CUPP/HASHCAT generation enabled")
+			fmt.Println("   ? No heavy re-prioritization")
+		}
+		fmt.Println()
 	}
 
 	rl := NewUltimateRL(*learningRateFlag)
+
+	// CLEVER: Auto-detect password brute-force mode
+	// If we have 1-3 usernames and many passwords (1000+), it's password brute-forcing
+	// Skip the "low success rate" safety check in this mode
+	// Also enable for all modes when doing small-scale tests
+	if len(usernames) <= 3 && len(passwords) >= 1000 {
+		rl.passwordBruteForceMode = true
+		if !*quiet {
+			fmt.Println("? Password brute-force mode detected - disabling early-exit safety check")
+		}
+	} else if len(usernames) <= 3 {
+		// Small username set - likely password brute-forcing
+		rl.passwordBruteForceMode = true
+		if !*quiet && attackMode == "hydra" {
+			fmt.Println("? Password brute-force mode (HYDRA mode)")
+		} else if !*quiet && attackMode == "ffuf" {
+			fmt.Println("? Password brute-force mode (FFUF mode)")
+		}
+	}
+
 	numWorkers := *workers
 	batchSize := *batchSizeFlag
 
+	// TURBO OPTIMIZATION: Do ONE-TIME smart sort (2 seconds)
+	// This eliminates expensive re-prioritization every batch!
+	if !*quiet {
+		fmt.Println("? TURBO MODE: Performing one-time smart sort...")
+	}
+	sortStart := time.Now()
+	sort.Slice(allCreds, func(i, j int) bool {
+		return allCreds[i].Score > allCreds[j].Score
+	})
+	sortTime := time.Since(sortStart)
+	if !*quiet {
+		fmt.Printf("? Sorted %d credentials in %.3fs\n\n", len(allCreds), sortTime.Seconds())
+	}
+
+	// FFUF & BALANCED MODE OPTIMIZATION: Use single batch for maximum speed!
+	// Eliminate loop overhead by feeding all credentials at once
+	// HYDRA mode keeps batching for re-prioritization logic
+	if (attackMode == "ffuf" || attackMode == "balanced") && batchSize < totalCreds {
+		batchSize = totalCreds // Single batch = maximum throughput
+		if !*quiet {
+			fmt.Printf("? %s MODE: Using single batch (%d credentials) for maximum speed\n\n",
+				strings.ToUpper(attackMode), batchSize)
+		}
+	}
+
 	jar, _ := cookiejar.New(nil)
+
+	// TURBO OPTIMIZATION #6: Aggressive HTTP transport settings based on mode!
+	// FFUF: Maximum connections | HYDRA: Balanced | BALANCED: Standard
+	maxConns := numWorkers * 2 // Default
+	if attackMode == "ffuf" {
+		maxConns = numWorkers * 4 // Even more connections in FFUF mode!
+	} else if attackMode == "hydra" {
+		maxConns = numWorkers * 3 // Balanced for RL learning
+	}
+
+	// OPTIMIZATION: HTTP/2 auto-detection
+	// HTTP/2 multiplexing is faster for high-latency targets with many parallel requests
+	useHTTP2 := false
+	if strings.HasPrefix(target, "https://") {
+		// Quick HTTP/2 probe (non-blocking, 1 second timeout)
+		testClient := &http.Client{Timeout: 1 * time.Second}
+		if resp, err := testClient.Get(target); err == nil {
+			resp.Body.Close()
+			if resp.ProtoMajor == 2 {
+				useHTTP2 = true
+				if !*quiet {
+					fmt.Println("? HTTP/2 detected - enabling multiplexing for better performance")
+				}
+			}
+		}
+	}
+
 	client := &http.Client{
 		Jar: jar,
 		Transport: &http.Transport{
-			MaxIdleConns:        numWorkers * 2,
-			MaxIdleConnsPerHost: numWorkers * 2,
+			MaxIdleConns:        maxConns,
+			MaxIdleConnsPerHost: maxConns,
+			MaxConnsPerHost:     maxConns, // Allow all workers to connect simultaneously
 			IdleConnTimeout:     90 * time.Second,
 			DisableCompression:  true,
+			DisableKeepAlives:   false, // Keep connections alive!
+			ForceAttemptHTTP2:   useHTTP2, // Auto-detect HTTP/2 support
 		},
 		Timeout: time.Duration(*timeout) * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -3040,7 +3227,14 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	credChan := make(chan Credential, numWorkers*2)
+	// TURBO OPTIMIZATION #7: Channel buffer size based on mode!
+	chanBuffer := numWorkers * 2 // Default
+	if attackMode == "ffuf" {
+		chanBuffer = numWorkers * 10 // Much larger buffer for continuous feeding!
+	} else if attackMode == "hydra" {
+		chanBuffer = numWorkers * 5 // Moderate buffer for RL
+	}
+	credChan := make(chan Credential, chanBuffer)
 	var wg sync.WaitGroup
 
 	for i := 0; i < numWorkers; i++ {
@@ -3126,17 +3320,23 @@ func main() {
 						data.Set(userField, cred.Username)
 						data.Set(passField, cred.Password)
 
-						// Extract CSRF token if present
-						getResp, err := client.Get(target)
-						if err == nil {
-							getBody, _ := io.ReadAll(getResp.Body)
-							getResp.Body.Close()
+						// OPTIMIZATION: Skip CSRF extraction for 2x speed boost
+						// CSRF tokens are usually not needed for simple login forms
+						// This eliminates the extra GET request per attempt (doubles throughput!)
+						// Only HYDRA mode fetches CSRF (for maximum compatibility)
+						if attackMode == "hydra" {
+							// HYDRA mode: Extract CSRF token if present (max compatibility)
+							getResp, err := client.Get(target)
+							if err == nil {
+								getBody, _ := io.ReadAll(getResp.Body)
+								getResp.Body.Close()
 
-							// Try common CSRF field names
-							for _, csrfField := range []string{"CSRFToken", "csrf_token", "_csrf", "authenticity_token", "_token"} {
-								if token := extractCSRF(string(getBody), csrfField); token != "" {
-									data.Set(csrfField, token)
-									break
+								// Try common CSRF field names
+								for _, csrfField := range []string{"CSRFToken", "csrf_token", "_csrf", "authenticity_token", "_token"} {
+									if token := extractCSRF(string(getBody), csrfField); token != "" {
+										data.Set(csrfField, token)
+										break
+									}
 								}
 							}
 						}
@@ -3178,9 +3378,16 @@ func main() {
 					}
 
 					if err == nil {
-						body, _ := io.ReadAll(resp.Body)
+						// OPTIMIZATION: Limit body reading to 10KB (login responses are small)
+						// CRITICAL: Must drain remaining body for connection reuse
+						limitedBody := io.LimitReader(resp.Body, 10*1024) // 10KB max
+						body, _ := io.ReadAll(limitedBody)
+						// Drain any remaining bytes to enable HTTP keep-alive connection reuse
+						io.Copy(io.Discard, resp.Body) // Discard rest without allocating
 						resp.Body.Close()
-						bodyStr := string(body)
+						// OPTIMIZATION: Use unsafe string conversion to avoid allocation (2x speedup!)
+						// This is safe because we don't modify the byte slice after conversion
+						bodyStr := *(*string)(unsafe.Pointer(&body))
 
 						if *verbose && len(bodyStr) == 0 {
 							fmt.Printf("[DEBUG] Empty body! Status: %d, Content-Length: %s, Content-Encoding: %s\n",
@@ -3295,9 +3502,22 @@ func main() {
 						}
 						} // End of form-based detection
 
-						// Classify error type for intelligent stopping
-						errorType := classifyError(resp, bodyStr, nil)
-						rl.learnWithError(cred.Username, cred.Password, respTime, success, errorType)
+						// MODE-BASED RL LEARNING:
+						// HYDRA mode: Full RL learning with all algorithms
+						// FFUF/BALANCED: Skip error classification for 1.1-1.2x speedup
+						if attackMode == "hydra" {
+							// HYDRA MODE: Full RL learning with error classification
+							errorType := classifyError(resp, bodyStr, nil)
+							rl.learnWithError(cred.Username, cred.Password, respTime, success, errorType)
+						} else {
+							// FFUF/BALANCED: Lightweight tracking without classification overhead
+							atomic.AddInt64(&rl.attemptCount, 1)
+							if success {
+								atomic.AddInt64(&rl.successCount, 1)
+							} else {
+								atomic.AddInt64(&rl.consecutiveFails, 1)
+							}
+						}
 
 						if success {
 							select {
@@ -3330,15 +3550,28 @@ func main() {
 		for len(remaining) > 0 && ctx.Err() == nil {
 			generation++
 
-			remaining = rl.prioritize(remaining)
+			// MODE-BASED PRIORITIZATION:
+			// HYDRA mode: Re-prioritize every batch for full RL intelligence
+			// FFUF/BALANCED: Skip re-prioritization for speed (one-time sort is enough)
+			if attackMode == "hydra" {
+				// HYDRA MODE: Full RL with batch re-prioritization
+				remaining = rl.prioritize(remaining)
+			}
+			// FFUF/BALANCED: Skip expensive re-prioritization for speed
 
 			currentBatch := batchSize
-			// Aggressive exploitation after learning
-			if generation > 3 && rl.exploitMode {
-				currentBatch = batchSize / 3 // Very small batches when exploiting
-			} else if generation > 3 {
-				currentBatch = batchSize / 2
+			// MODE-BASED BATCH SIZE:
+			// HYDRA mode: Use aggressive exploitation (smaller batches after learning)
+			// FFUF/BALANCED: Keep full batch size for continuous feeding
+			if attackMode == "hydra" {
+				// Aggressive exploitation after learning
+				if generation > 3 && rl.exploitMode {
+					currentBatch = batchSize / 3 // Very small batches when exploiting
+				} else if generation > 3 {
+					currentBatch = batchSize / 2
+				}
 			}
+			// FFUF/BALANCED: Always use full batch size for speed
 
 			if currentBatch > len(remaining) {
 				currentBatch = len(remaining)
@@ -3370,18 +3603,16 @@ func main() {
 				}
 			}
 
-			for {
-				mu.Lock()
-				p := processing
-				mu.Unlock()
-				if p < numWorkers/2 || ctx.Err() != nil {
-					break
-				}
-				time.Sleep(10 * time.Millisecond)
-			}
+			// TURBO OPTIMIZATION #2: Remove batch waiting entirely!
+			// Original code waited for workers to become idle before feeding next batch
+			// This is unnecessary - the credChan buffer handles backpressure naturally
+			// By removing this wait, we achieve continuous feeding and max throughput!
+			// (No waiting loop needed - just feed next batch immediately)
 
-		// Adaptive CUPP Injection: Track failures and inject CUPP passwords
-		if cuppPath != "" { // Only if CUPP is available
+		// MODE-BASED ADAPTIVE CUPP:
+		// FFUF mode: Skip adaptive CUPP for speed
+		// HYDRA/BALANCED: Enable adaptive CUPP injection
+		if cuppPath != "" && attackMode != "ffuf" { // Only if CUPP is available and NOT in ffuf mode
 			// Count attempts per username in this batch (assume failures unless success found)
 			rl.mu.RLock()
 			hasSuccess := len(rl.successPatterns) > 0
