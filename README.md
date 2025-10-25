@@ -58,16 +58,17 @@ go build -o cerebro cerebro.go
 ### Basic Usage
 
 ```bash
-# Auto-detection mode (recommended)
+# BALANCED mode (default - recommended)
 ./revlos --auto -L users.txt -P passwords.txt http://target.com
 
-# Manual mode with form specification
-./revlos -L users.txt -P passwords.txt \
-  http://target.com \
-  http-post-form "/login:username=^USER^&password=^PASS^:F=Invalid"
+# FFUF mode (maximum speed)
+./revlos --mode ffuf --auto -L users.txt -P passwords.txt http://target.com
+
+# HYDRA mode (full RL intelligence)
+./revlos --mode hydra --auto -L users.txt -P passwords.txt http://target.com
 
 # HTTP Basic Authentication
-./revlos --auto -L users.txt -P passwords.txt --basic-auth http://target.com
+./revlos --auto -L users.txt -P passwords.txt http://target.com
 
 # Stop on first valid credential
 ./revlos --auto -L users.txt -P passwords.txt -f http://target.com
@@ -76,22 +77,39 @@ go build -o cerebro cerebro.go
 ./revlos --auto -L users.txt -P passwords.txt --headless http://target.com
 ```
 
----
-
-### Usage Examples
-
-#### Web Application Login
+### FFUF Mode - Speed Test (CTF)
 ```bash
-./revlos --auto -L usernames.txt -P rockyou.txt \
-  -f --timeout 15 http://example.com/login
+./revlos --mode ffuf --auto -L usernames.txt -P rockyou.txt \
+  -f -t 200 http://ctf.example.com/login
+# Result: 3.6x faster than standard ffuf
 ```
 
-#### Custom Success Detection
+#### BALANCED Mode - Production Testing
 ```bash
-./revlos -L users.txt -P passwords.txt \
-  --success-text "Welcome" \
-  --any-redirect \
-  http://target.com/auth
+./revlos --auto -L users.txt -P passwords.txt \
+  -f --timeout 15 http://example.com/login
+# Result: Smart + Fast, no heavy overhead
+```
+
+#### HYDRA Mode - Adaptive Intelligence
+```bash
+./revlos --mode hydra --auto -L users.txt -P passwords.txt \
+  -f --learning-rate 0.4 http://complex-target.com
+# Result: Full RL learning, adaptive CUPP injection
+```
+
+#### User Enumeration (ffuf-style)
+```bash
+./revlos --ffuf-mode users --auto -L users.txt \
+  --ffuf-threads 40 http://target.com
+# Result: Differential timing analysis for valid usernames
+```
+
+#### Directory Fuzzing
+```bash
+./revlos --fuzz dir --fuzz-url http://target/FUZZ \
+  --fuzz-wordlist dirs.txt --match-status 200,301
+# Result: ffuf-compatible directory enumeration
 ```
 
 #### OSINT-Enhanced Attack
@@ -99,6 +117,16 @@ go build -o cerebro cerebro.go
 ./revlos --osint --auto -L users.txt -P passwords.txt \
   --username-anarchy-path ./username-anarchy/username-anarchy \
   http://corporate-site.com/login
+# Result: Auto-generates usernames from target scraping
+```
+
+#### Custom Success Detection
+```bash
+./revlos -L users.txt -P passwords.txt \
+  --success-text "Welcome" \
+  --success-code "200,302" \
+  --any-redirect \
+  http://target.com/auth
 ```
 
 #### Rate-Limited Target
@@ -106,11 +134,7 @@ go build -o cerebro cerebro.go
 ./revlos --auto -L users.txt -P passwords.txt \
   -t 10 --timeout 30 \
   http://slow-target.com
-```
-
-#### Single Credential Test
-```bash
-./revlos -l admin -p Admin123 --auto http://target.com
+# Intelligent stopping detects rate limits automatically
 ```
 
 ---
@@ -128,13 +152,19 @@ go build -o cerebro cerebro.go
 -t <threads>       Parallel tasks (default: 100)
 -q                 Quiet mode
 -v                 Verbose mode
+--host <URL>       Target URL (alternative to positional arg)
+--url <URL>        Alias for --host
+```
+
+#### Mode Selection
+```
+--mode <mode>      Attack mode: 'ffuf', 'balanced', 'hydra' (default: balanced)
 ```
 
 #### Auto-Detection
 ```
 --auto             Auto-detect form fields and error messages
 --headless         Use headless browser for JavaScript sites
---basic-auth       Force HTTP Basic Authentication mode
 ```
 
 #### Success Detection
@@ -143,6 +173,28 @@ go build -o cerebro cerebro.go
 --success-cookie <c>  Cookie name indicating success
 --success-code <c>    HTTP status codes for success (e.g., 200,302)
 --any-redirect        Treat any 3xx redirect as success
+```
+
+#### User Enumeration (ffuf-style)
+```
+--ffuf-mode <mode>     Enumeration mode: 'users' or 'passwords'
+--ffuf-url <URL>       Target URL for enumeration
+--ffuf-threads <N>     Concurrent threads (1-100, default: 1)
+--ffuf-invalid <pat>   Pattern for invalid usernames (auto-detected)
+--ffuf-valid <pat>     Pattern for valid usernames (auto-detected)
+```
+
+#### General Fuzzing (ffuf-compatible)
+```
+--fuzz <mode>          Fuzzing mode: 'dir', 'vhost', 'param'
+--fuzz-url <URL>       URL with FUZZ keyword (e.g., http://target/FUZZ)
+--fuzz-wordlist <file> Wordlist for fuzzing (or use -L)
+--fuzz-keyword <word>  Keyword to replace (default: FUZZ)
+--fuzz-method <method> HTTP method (default: GET)
+--fuzz-data <data>     POST data with FUZZ keyword
+--fuzz-header <header> Header with FUZZ (e.g., 'Host: FUZZ.target.com')
+--match-status <codes> Match status codes (e.g., '200,301,302')
+--filter-status <code> Filter status codes (default: 404)
 ```
 
 #### Advanced Options
@@ -160,6 +212,7 @@ go build -o cerebro cerebro.go
 --osint                      Enable OSINT intelligence gathering
 --username-anarchy-path <p>  Path to username-anarchy tool
 ```
+
 
 ---
 
