@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -931,6 +932,449 @@ func detectErrorMessage(targetURL, userField, passField, method string) (string,
 
 	// Default fallback
 	return "Invalid credentials", nil
+}
+
+// detectDifferentialErrors detects different error messages for invalid vs valid usernames
+// Returns: invalidPattern (for wrong usernames), validPattern (for valid username/wrong password), error
+func detectDifferentialErrors(targetURL, userField, passField, method string) (string, string, error) {
+	// Test 1: Definitely invalid username
+	invalidUser := fmt.Sprintf("invalid_xyz_%d", rand.Intn(999999))
+
+	data1 := url.Values{}
+	data1.Set(userField, invalidUser)
+	data1.Set(passField, "testpass123")
+
+	var resp1 *http.Response
+	var err error
+
+	if strings.ToUpper(method) == "GET" {
+		testURL := targetURL
+		if strings.Contains(targetURL, "?") {
+			testURL += "&" + data1.Encode()
+		} else {
+			testURL += "?" + data1.Encode()
+		}
+		resp1, err = http.Get(testURL)
+	} else {
+		resp1, err = http.Post(targetURL, "application/x-www-form-urlencoded", strings.NewReader(data1.Encode()))
+	}
+
+	if err != nil {
+		return "", "", err
+	}
+
+	body1, _ := io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+	bodyStr1 := string(body1)
+
+	// Test 2: Try common/known usernames that might exist
+	possibleValidUsers := []string{"admin", "root", "user", "htb-stdnt", "test", "guest"}
+	var bodyStr2 string
+	var foundDifference bool
+
+	for _, testUser := range possibleValidUsers {
+		data2 := url.Values{}
+		data2.Set(userField, testUser)
+		data2.Set(passField, "wrongpassword999")
+
+		var resp2 *http.Response
+		if strings.ToUpper(method) == "GET" {
+			testURL := targetURL
+			if strings.Contains(targetURL, "?") {
+				testURL += "&" + data2.Encode()
+			} else {
+				testURL += "?" + data2.Encode()
+			}
+			resp2, err = http.Get(testURL)
+		} else {
+			resp2, err = http.Post(targetURL, "application/x-www-form-urlencoded", strings.NewReader(data2.Encode()))
+		}
+
+		if err != nil {
+			continue
+		}
+
+		body2, _ := io.ReadAll(resp2.Body)
+		resp2.Body.Close()
+		bodyStr2 = string(body2)
+
+		// Check if responses are different
+		if bodyStr1 != bodyStr2 {
+			foundDifference = true
+			break
+		}
+	}
+
+	if !foundDifference {
+		return "", "", fmt.Errorf("no differential error messages detected")
+	}
+
+	// Extract error patterns from both responses
+	invalidPattern := extractPrimaryErrorString(bodyStr1)
+	validPattern := extractPrimaryErrorString(bodyStr2)
+
+	// Validate we got different patterns
+	if invalidPattern == validPattern || invalidPattern == "" || validPattern == "" {
+		return "", "", fmt.Errorf("could not distinguish error patterns")
+	}
+
+	return invalidPattern, validPattern, nil
+}
+
+// extractPrimaryErrorString extracts the main error message from HTML body
+func extractPrimaryErrorString(body string) string {
+	bodyLower := strings.ToLower(body)
+
+	// Priority 1: Look for specific error phrases
+	knownErrors := []string{
+		"unknown user", "user not found", "invalid user",
+		"invalid credentials", "incorrect credentials", "wrong credentials",
+		"invalid password", "wrong password", "incorrect password",
+		"authentication failed", "login failed",
+	}
+
+	for _, errPhrase := range knownErrors {
+		if strings.Contains(bodyLower, errPhrase) {
+			// Find exact match with original casing
+			idx := strings.Index(bodyLower, errPhrase)
+			if idx != -1 && idx+len(errPhrase) <= len(body) {
+				return body[idx : idx+len(errPhrase)]
+			}
+		}
+	}
+
+	// Priority 2: Look for error class/div
+	if strings.Contains(body, "class=\"error\"") || strings.Contains(body, "class='error'") {
+		re := regexp.MustCompile(`(?i)<[^>]*class=["']error["'][^>]*>([^<]+)<`)
+		if matches := re.FindStringSubmatch(body); len(matches) > 1 {
+			text := strings.TrimSpace(matches[1])
+			if len(text) > 3 && len(text) < 100 {
+				return text
+			}
+		}
+	}
+
+	// Priority 3: Look for JSON error
+	if strings.Contains(body, `"error"`) {
+		re := regexp.MustCompile(`"error"\s*:\s*"([^"]+)"`)
+		if matches := re.FindStringSubmatch(body); len(matches) > 1 {
+			return matches[1]
+		}
+	}
+
+	return ""
+}
+
+// runUserEnumeration performs ffuf-style user enumeration
+func runUserEnumeration(targetURL, userField, passField, method, invalidPattern, validPattern, usernameList, password string, timeout, threads int, quiet, verbose, stopOnFirst bool) {
+	// Load username list
+	if usernameList == "" {
+		fmt.Printf("? Username list required for user enumeration mode (-L flag)\n")
+		os.Exit(1)
+	}
+
+	usernames, err := loadWordlist(usernameList)
+	if err != nil {
+		fmt.Printf("? Failed to load username list: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Single password for testing (can be anything)
+	testPassword := "test123"
+	if password != "" {
+		testPassword = password
+	}
+
+	// Ensure threads is reasonable
+	if threads < 1 {
+		threads = 1
+	}
+	if threads > 100 {
+		fmt.Printf("??  Max 100 threads, using 100\n")
+		threads = 100
+	}
+
+	fmt.Printf("\n? User Enumeration Mode (ffuf-style)\n")
+	fmt.Printf("=====================================\n")
+	fmt.Printf("Target:          %s\n", targetURL)
+	fmt.Printf("Usernames:       %d\n", len(usernames))
+	fmt.Printf("Threads:         %d\n", threads)
+	fmt.Printf("Invalid Pattern: \"%s\"\n", invalidPattern)
+	fmt.Printf("Valid Pattern:   \"%s\"\n\n", validPattern)
+
+	validUsers := []string{}
+	var validUsersMutex sync.Mutex
+	startTime := time.Now()
+
+	// Pre-compute checks (avoid repeated string operations in loop)
+	isGET := strings.ToUpper(method) == "GET"
+	hasQueryString := strings.Contains(targetURL, "?")
+	queryPrefix := "?"
+	if hasQueryString {
+		queryPrefix = "&"
+	}
+
+	// Semaphore for concurrency control
+	sem := make(chan struct{}, threads)
+	var wg sync.WaitGroup
+	shouldStop := false
+	var stopMutex sync.Mutex
+
+	// Process each username (potentially in parallel)
+	for i, username := range usernames {
+		// Check if we should stop
+		stopMutex.Lock()
+		if shouldStop {
+			stopMutex.Unlock()
+			break
+		}
+		stopMutex.Unlock()
+
+		wg.Add(1)
+		sem <- struct{}{} // Acquire semaphore
+
+		go func(idx int, user string) {
+			defer wg.Done()
+			defer func() { <-sem }() // Release semaphore
+
+			// Create HTTP client per goroutine
+			client := &http.Client{
+				Timeout: time.Duration(timeout) * time.Second,
+			}
+
+			data := url.Values{}
+			data.Set(userField, user)
+			data.Set(passField, testPassword)
+
+			var resp *http.Response
+			var err error
+
+			if isGET {
+				testURL := targetURL + queryPrefix + data.Encode()
+				resp, err = client.Get(testURL)
+			} else {
+				resp, err = client.Post(targetURL, "application/x-www-form-urlencoded", strings.NewReader(data.Encode()))
+			}
+
+			if err != nil {
+				if !quiet {
+					fmt.Printf("[%d/%d] %s ? Error: %v\n", idx+1, len(usernames), user, err)
+				}
+				return
+			}
+
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			bodyStr := string(body)
+
+			// Check patterns (like ffuf's -fr flag)
+			if strings.Contains(bodyStr, invalidPattern) {
+				// Invalid username - skip silently (like ffuf's filter)
+				if verbose {
+					fmt.Printf("[%d/%d] %s ? Invalid user\n", idx+1, len(usernames), user)
+				}
+			} else if strings.Contains(bodyStr, validPattern) {
+				// Valid username found!
+				fmt.Printf("? VALID USER: %s\n", user)
+
+				validUsersMutex.Lock()
+				validUsers = append(validUsers, user)
+				validUsersMutex.Unlock()
+
+				if stopOnFirst {
+					stopMutex.Lock()
+					shouldStop = true
+					stopMutex.Unlock()
+				}
+			} else {
+				// Neither pattern - ambiguous
+				if verbose {
+					fmt.Printf("[%d/%d] %s ? Ambiguous response\n", idx+1, len(usernames), user)
+				}
+			}
+		}(i, username)
+	}
+
+	// Wait for all goroutines to finish
+	wg.Wait()
+
+	duration := time.Since(startTime)
+
+	// Final summary
+	fmt.Printf("\n========================================\n")
+	if len(validUsers) > 0 {
+		fmt.Printf("? Found %d valid username(s) in %.2fs\n\n", len(validUsers), duration.Seconds())
+		for _, user := range validUsers {
+			fmt.Printf("   %s\n", user)
+		}
+	} else {
+		fmt.Printf("? No valid usernames found\n")
+		fmt.Printf("   Tested: %d usernames\n", len(usernames))
+		fmt.Printf("   Time: %.2fs\n", duration.Seconds())
+	}
+	fmt.Printf("========================================\n")
+
+	os.Exit(0)
+}
+
+// runFuzzing performs general web fuzzing (directories, vhosts, params) - ffuf-style
+func runFuzzing(targetURL, keyword, wordlist, method, postData, header string, threads int, matchCodes, filterCodes string, quiet bool) {
+	// Load wordlist
+	words, err := loadWordlist(wordlist)
+	if err != nil {
+		fmt.Printf("? Failed to load wordlist: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Parse status codes
+	matchStatuses := parseStatusCodes(matchCodes)
+	filterStatuses := parseStatusCodes(filterCodes)
+
+	// Validate FUZZ keyword exists
+	if !strings.Contains(targetURL, keyword) && !strings.Contains(postData, keyword) && !strings.Contains(header, keyword) {
+		fmt.Printf("? FUZZ keyword '%s' not found in URL, POST data, or header\n", keyword)
+		os.Exit(1)
+	}
+
+	// Threading setup
+	if threads < 1 {
+		threads = 1
+	}
+	if threads > 100 {
+		threads = 100
+	}
+
+	sem := make(chan struct{}, threads)
+	var wg sync.WaitGroup
+	var resultCount int
+	var resultMutex sync.Mutex
+
+	fmt.Printf("\n? Fuzzing Mode (ffuf-style)\n")
+	fmt.Printf("=====================================\n")
+	fmt.Printf("Target:   %s\n", targetURL)
+	fmt.Printf("Keyword:  %s\n", keyword)
+	fmt.Printf("Words:    %d\n", len(words))
+	fmt.Printf("Threads:  %d\n", threads)
+	if len(filterStatuses) > 0 {
+		fmt.Printf("Filter:   Status %v\n", filterStatuses)
+	}
+	if len(matchStatuses) > 0 {
+		fmt.Printf("Match:    Status %v\n", matchStatuses)
+	}
+	fmt.Println()
+
+	startTime := time.Now()
+
+	// Fuzz each word
+	for _, word := range words {
+		wg.Add(1)
+		sem <- struct{}{}
+
+		go func(fuzzValue string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			// Create client
+			client := &http.Client{Timeout: 10 * time.Second}
+
+			// Replace FUZZ in URL
+			finalURL := strings.ReplaceAll(targetURL, keyword, fuzzValue)
+
+			// Replace FUZZ in POST data
+			finalData := strings.ReplaceAll(postData, keyword, fuzzValue)
+
+			// Create request
+			var req *http.Request
+			if method == "POST" && finalData != "" {
+				req, err = http.NewRequest("POST", finalURL, strings.NewReader(finalData))
+				if err != nil {
+					return
+				}
+				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			} else {
+				req, err = http.NewRequest(method, finalURL, nil)
+				if err != nil {
+					return
+				}
+			}
+
+			// Replace FUZZ in header
+			if header != "" {
+				parts := strings.SplitN(header, ":", 2)
+				if len(parts) == 2 {
+					headerName := strings.TrimSpace(parts[0])
+					headerValue := strings.ReplaceAll(strings.TrimSpace(parts[1]), keyword, fuzzValue)
+					req.Header.Set(headerName, headerValue)
+				}
+			}
+
+			// Send request
+			resp, err := client.Do(req)
+			if err != nil {
+				return
+			}
+			defer resp.Body.Close()
+
+			// Read response
+			body, _ := io.ReadAll(resp.Body)
+			size := len(body)
+			lines := strings.Count(string(body), "\n")
+			words := len(strings.Fields(string(body)))
+
+			// Apply filters
+			if len(filterStatuses) > 0 && containsInt(filterStatuses, resp.StatusCode) {
+				return
+			}
+			if len(matchStatuses) > 0 && !containsInt(matchStatuses, resp.StatusCode) {
+				return
+			}
+
+			// Valid result!
+			resultMutex.Lock()
+			resultCount++
+			resultMutex.Unlock()
+
+			// Print result (ffuf-style output)
+			fmt.Printf("[Status: %d] [Size: %d] [Words: %d] [Lines: %d] %s\n",
+				resp.StatusCode, size, words, lines, finalURL)
+
+		}(word)
+	}
+
+	wg.Wait()
+	duration := time.Since(startTime)
+
+	// Summary
+	fmt.Printf("\n========================================\n")
+	fmt.Printf("? Found %d results in %.2fs\n", resultCount, duration.Seconds())
+	fmt.Printf("========================================\n")
+
+	os.Exit(0)
+}
+
+// parseStatusCodes converts "200,301,302" into []int{200, 301, 302}
+func parseStatusCodes(codes string) []int {
+	if codes == "" {
+		return nil
+	}
+	var result []int
+	for _, code := range strings.Split(codes, ",") {
+		code = strings.TrimSpace(code)
+		if c, err := strconv.Atoi(code); err == nil {
+			result = append(result, c)
+		}
+	}
+	return result
+}
+
+// containsInt checks if slice contains val
+func containsInt(slice []int, val int) bool {
+	for _, item := range slice {
+		if item == val {
+			return true
+		}
+	}
+	return false
 }
 
 func loadWordlist(path string) ([]string, error) {
@@ -1966,6 +2410,7 @@ func main() {
 		password       = flag.String("p", "", "Single password (literal)")
 		passwordList   = flag.String("P", "", "Password list file")
 		host           = flag.String("host", "", "Target host (or use positional argument)")
+		url_flag       = flag.String("url", "", "Alias for --host (target URL or hostname)")
 		port           = flag.Int("s", 80, "Port number")
 		stopOnFirst    = flag.Bool("f", false, "Stop when first valid credential found")
 		workers        = flag.Int("t", 100, "Number of parallel tasks (threads)")
@@ -1987,49 +2432,143 @@ func main() {
 		// OSINT integration
 		osintMode        = flag.Bool("osint", false, "Enable OSINT intelligence gathering from target")
 		anarchyPath      = flag.String("username-anarchy-path", "", "Path to username-anarchy tool")
+		// User enumeration mode
+		ffufMode         = flag.String("ffuf-mode", "", "Enumeration mode: 'users' or 'passwords'")
+		ffufURL          = flag.String("ffuf-url", "", "Target URL for ffuf mode (alternative to positional arg)")
+		ffufInvalid      = flag.String("ffuf-invalid", "", "Pattern for invalid usernames (auto-detected if empty)")
+		ffufValid        = flag.String("ffuf-valid", "", "Pattern for valid usernames (auto-detected if empty)")
+		ffufThreads      = flag.Int("ffuf-threads", 1, "Concurrent threads for user enumeration (default: 1 for stealth)")
+		// General fuzzing mode (ffuf-style)
+		fuzzMode         = flag.String("fuzz", "", "General fuzzing: 'dir', 'vhost', 'param' (requires --fuzz-url)")
+		fuzzURL          = flag.String("fuzz-url", "", "URL with FUZZ keyword (e.g., http://target/FUZZ)")
+		fuzzWordlist     = flag.String("fuzz-wordlist", "", "Wordlist for fuzzing (can also use -L)")
+		fuzzKeyword      = flag.String("fuzz-keyword", "FUZZ", "Keyword to replace (default: FUZZ)")
+		fuzzMethod       = flag.String("fuzz-method", "GET", "HTTP method for fuzzing")
+		fuzzData         = flag.String("fuzz-data", "", "POST data with FUZZ keyword")
+		fuzzHeader       = flag.String("fuzz-header", "", "Header with FUZZ (e.g., 'Host: FUZZ.target.com')")
+		matchStatus      = flag.String("match-status", "", "Match status codes (e.g., '200,301,302')")
+		filterStatus     = flag.String("filter-status", "404", "Filter status codes (default: 404)")
 	)
 
 	flag.Parse()
 
+	// EARLY EXIT: General fuzzing mode (ffuf-style directory/vhost/param fuzzing)
+	if *fuzzMode != "" && *fuzzURL != "" {
+		// Determine wordlist source (--fuzz-wordlist or -L)
+		wordlist := *fuzzWordlist
+		if wordlist == "" {
+			wordlist = *usernameList
+		}
+		if wordlist == "" {
+			fmt.Printf("? Wordlist required for fuzzing mode (--fuzz-wordlist or -L)\n")
+			os.Exit(1)
+		}
+
+		runFuzzing(*fuzzURL, *fuzzKeyword, wordlist, *fuzzMethod, *fuzzData, *fuzzHeader,
+		           *ffufThreads, *matchStatus, *filterStatus, *quiet)
+		return
+	}
+
 	// Parse arguments: host [http-post-form] "form-spec"
 	args := flag.Args()
-	if len(args) < 1 {
-		fmt.Println("? revlos - Ultimate RL Brute Forcer")
-		fmt.Println("Usage: revlos [-l user | -L userlist] [-p pass | -P passlist] -f host -s port [--auto | http-post-form \"spec\"]")
-		fmt.Println("\nHydra-compatible parameters:")
-		fmt.Println("  -l <user>     Single username (literal)")
-		fmt.Println("  -L <file>     Username list file or URL")
-		fmt.Println("  -p <pass>     Single password (literal)")
-		fmt.Println("  -P <file>     Password list file or URL")
-		fmt.Println("  -f            Stop on first valid credential")
-		fmt.Println("  -s <port>     Port (default: 80)")
-		fmt.Println("  -t <tasks>    Parallel tasks/threads (default: 100)")
-		fmt.Println("  -q                Quiet mode")
-		fmt.Println("  -v                Verbose mode")
-		fmt.Println("  --auto            Auto-detect form fields and error messages")
-		fmt.Println("  --timeout <n>     Request timeout in seconds (default: 10)")
-		fmt.Println("  --max-time <n>    Maximum total time in seconds (default: no limit)")
-		fmt.Println("  --success-text <s>   Text in response indicating success")
-		fmt.Println("  --success-cookie <s> Cookie name indicating success")
-		fmt.Println("  --success-code <c>   HTTP codes for success (e.g., 200,302)")
-		fmt.Println("  --any-redirect    Treat any 3xx redirect as success")
-		fmt.Println("  --method <m>      HTTP method: GET or POST (default: POST)")
-		fmt.Println("  --header <h>      Custom headers (e.g., 'Referer:http://x.com,X-Forwarded-For:1.1.1.1')")
-		fmt.Println("  --headless        Use headless browser (--auto mode auto-switches if SPA detected)")
-		fmt.Println("\nPositional arguments:")
-		fmt.Println("  <host>                Target host or IP")
-		fmt.Println("  http-post-form        Optional literal (can be omitted)")
-		fmt.Println("  \"form-spec\"           Format: \"path:params:failure_condition\"")
-		fmt.Println("\nExamples:")
-		fmt.Println("  Manual:  revlos -L users.txt -P passwords.txt -s 8080 -f target.com http-post-form \"/:username=^USER^&password=^PASS^:F=Invalid\"")
-		fmt.Println("  Auto:    revlos -L users.txt -P passwords.txt -s 8080 -f --auto target.com")
-		fmt.Println("  Custom:  revlos -L users.txt -P passwords.txt --any-redirect --timeout 30 target.com http-post-form \"/:user=^USER^&pass=^PASS^:F=Error\"")
+
+	// Check if we have a URL from any source (positional, --host, --url, --ffuf-url)
+	hasURL := len(args) >= 1 || *host != "" || *url_flag != "" || *ffufURL != ""
+
+	if !hasURL {
+		fmt.Println("? revlos - Ultimate RL Multi-Algorithm Brute Forcer + ffuf-style Enumeration")
+		fmt.Println("================================================================================")
+		fmt.Println("\nUsage:")
+		fmt.Println("  Brute Force:    revlos [-l user | -L userlist] [-p pass | -P passlist] [--host URL | URL] [--auto | form-spec]")
+		fmt.Println("  User Enum:      revlos --ffuf-mode users --ffuf-url URL -L userlist --ffuf-threads N --auto")
+		fmt.Println("  Dir/Vhost Fuzz: revlos --fuzz [dir|vhost|param] --fuzz-url URL --fuzz-wordlist file")
+
+		fmt.Println("\n=== Core Parameters (Hydra-compatible) ===")
+		fmt.Println("  -l <user>              Single username (literal)")
+		fmt.Println("  -L <file>              Username list file or URL")
+		fmt.Println("  -p <pass>              Single password (literal)")
+		fmt.Println("  -P <file>              Password list file or URL")
+		fmt.Println("  -f                     Stop on first valid credential")
+		fmt.Println("  -s <port>              Port (default: 80)")
+		fmt.Println("  -t <tasks>             Parallel tasks/threads (default: 100)")
+		fmt.Println("  -q                     Quiet mode")
+		fmt.Println("  -v                     Verbose mode")
+		fmt.Println("  --host <URL>           Target URL (alternative to positional arg)")
+		fmt.Println("  --url <URL>            Alias for --host")
+
+		fmt.Println("\n=== ffuf-style User Enumeration ===")
+		fmt.Println("  --ffuf-mode <mode>     Enumeration mode: 'users' or 'passwords'")
+		fmt.Println("  --ffuf-url <URL>       Target URL for enumeration (flags can be in any order)")
+		fmt.Println("  --ffuf-threads <N>     Concurrent threads (1-100, default: 1)")
+		fmt.Println("  --ffuf-invalid <pat>   Pattern for invalid usernames (auto-detected if empty)")
+		fmt.Println("  --ffuf-valid <pat>     Pattern for valid usernames (auto-detected if empty)")
+
+		fmt.Println("\n=== General Fuzzing (ffuf-style) ===")
+		fmt.Println("  --fuzz <mode>          Fuzzing mode: 'dir', 'vhost', 'param'")
+		fmt.Println("  --fuzz-url <URL>       URL with FUZZ keyword (e.g., http://target/FUZZ)")
+		fmt.Println("  --fuzz-wordlist <file> Wordlist for fuzzing (or use -L)")
+		fmt.Println("  --fuzz-keyword <word>  Keyword to replace (default: FUZZ)")
+		fmt.Println("  --fuzz-method <method> HTTP method (default: GET)")
+		fmt.Println("  --fuzz-data <data>     POST data with FUZZ keyword")
+		fmt.Println("  --fuzz-header <header> Header with FUZZ (e.g., 'Host: FUZZ.target.com')")
+		fmt.Println("  --match-status <codes> Match status codes (e.g., '200,301,302')")
+		fmt.Println("  --filter-status <code> Filter status codes (default: 404)")
+
+		fmt.Println("\n=== Auto-Detection & Success Detection ===")
+		fmt.Println("  --auto                 Auto-detect form fields and error messages")
+		fmt.Println("  --success-text <s>     Text in response indicating success")
+		fmt.Println("  --success-cookie <s>   Cookie name indicating success")
+		fmt.Println("  --success-code <c>     HTTP codes for success (e.g., 200,302)")
+		fmt.Println("  --any-redirect         Treat any 3xx redirect as success")
+
+		fmt.Println("\n=== Advanced Options ===")
+		fmt.Println("  --timeout <n>          Request timeout in seconds (default: 10)")
+		fmt.Println("  --max-time <n>         Maximum total time in seconds")
+		fmt.Println("  --method <m>           HTTP method: GET or POST (default: POST)")
+		fmt.Println("  --header <h>           Custom headers (comma-separated)")
+		fmt.Println("  --headless             Use headless browser (auto-enabled for SPAs)")
+
+		fmt.Println("\n=== Positional Arguments (Legacy) ===")
+		fmt.Println("  <host>                 Target host or IP")
+		fmt.Println("  http-post-form         Optional literal (can be omitted)")
+		fmt.Println("  \"form-spec\"            Format: \"path:params:failure_condition\"")
+
+		fmt.Println("\n=== Examples ===")
+		fmt.Println("  # User enumeration (ffuf-style, 40 threads)")
+		fmt.Println("  revlos --ffuf-mode users --ffuf-url http://target.com --ffuf-threads 40 --auto -L users.txt")
+		fmt.Println("")
+		fmt.Println("  # User enumeration (flags in any order)")
+		fmt.Println("  revlos --ffuf-threads 40 --ffuf-mode users --auto -L users.txt --ffuf-url http://target.com")
+		fmt.Println("")
+		fmt.Println("  # Directory fuzzing")
+		fmt.Println("  revlos --fuzz dir --fuzz-url http://target/FUZZ --fuzz-wordlist dirs.txt --match-status 200,301")
+		fmt.Println("")
+		fmt.Println("  # Vhost fuzzing")
+		fmt.Println("  revlos --fuzz vhost --fuzz-url http://FUZZ.target.com --fuzz-wordlist vhosts.txt --filter-status 404")
+		fmt.Println("")
+		fmt.Println("  # Classic brute force (auto-detect)")
+		fmt.Println("  revlos -L users.txt -P passwords.txt --auto http://target.com")
+		fmt.Println("")
+		fmt.Println("  # Classic brute force (manual spec)")
+		fmt.Println("  revlos -L users.txt -P passwords.txt http://target.com \"/:user=^USER^&pass=^PASS^:F=Invalid\"")
+		fmt.Println("")
+		fmt.Println("For more info: https://github.com/emdnaia/revlos")
 		os.Exit(1)
 	}
 
-	targetHost := args[0]
+	var targetHost string
+	if len(args) >= 1 {
+		targetHost = args[0]
+	}
 	if *host != "" {
 		targetHost = *host
+	}
+	if *url_flag != "" {
+		targetHost = *url_flag
+	}
+	// ffuf mode can use --ffuf-url to override
+	if *ffufMode != "" && *ffufURL != "" {
+		targetHost = *ffufURL
 	}
 
 	// Build initial target URL for auto-detection
@@ -2116,18 +2655,58 @@ func main() {
 		if detectedMethod == "" {
 			detectedMethod = *method
 		}
-		failureString, err = detectErrorMessage(testURL, userField, passField, detectedMethod)
-		if err != nil {
-			fmt.Printf("??  Could not detect error message, using default\n")
-			failureString = "Invalid credentials"
-		}
 
-		if !*quiet {
-			fmt.Printf("? Detected error message: \"%s\"\n", failureString)
-			fmt.Println()
+		// User enumeration mode: detect differential error patterns
+		if *ffufMode == "users" {
+			invalidPattern, validPattern, err := detectDifferentialErrors(testURL, userField, passField, detectedMethod)
+			if err == nil {
+				*ffufInvalid = invalidPattern
+				*ffufValid = validPattern
+				if !*quiet {
+					fmt.Printf("? User enumeration mode detected\n")
+					fmt.Printf("   Invalid user pattern: \"%s\"\n", invalidPattern)
+					fmt.Printf("   Valid user pattern:   \"%s\"\n", validPattern)
+					fmt.Println()
+				}
+			} else {
+				// Differential detection failed - use manual patterns or defaults
+				if *ffufInvalid == "" {
+					*ffufInvalid = "Invalid credentials"  // Default invalid pattern
+				}
+				if *ffufValid == "" {
+					*ffufValid = "Unknown user"  // Default valid pattern (reversed logic for detection)
+				}
+				fmt.Printf("??  Could not detect differential errors: %v\n", err)
+				fmt.Printf("??  Using default patterns: invalid=\"%s\", valid=\"%s\"\n", *ffufInvalid, *ffufValid)
+				if *ffufMode == "users" && *ffufValid != "" && *ffufInvalid != "" {
+					fmt.Printf("??  User enumeration will continue with default patterns\n")
+				}
+				if !*quiet {
+					fmt.Println()
+				}
+			}
+			failureString = *ffufInvalid
+		} else {
+			// Normal mode: detect single failure pattern
+			failureString, err = detectErrorMessage(testURL, userField, passField, detectedMethod)
+			if err != nil {
+				fmt.Printf("??  Could not detect error message, using default\n")
+				failureString = "Invalid credentials"
+			}
+
+			if !*quiet {
+				fmt.Printf("? Detected error message: \"%s\"\n", failureString)
+				fmt.Println()
+			}
 		}
 
 		params = fmt.Sprintf("%s=^USER^&%s=^PASS^", userField, passField)
+
+		// EARLY EXIT: User enumeration mode (like ffuf -fr)
+		if *ffufMode == "users" && *ffufValid != "" && *ffufInvalid != "" {
+			runUserEnumeration(testURL, userField, passField, detectedMethod, *ffufInvalid, *ffufValid, *usernameList, *password, *timeout, *ffufThreads, *quiet, *verbose, *stopOnFirst)
+			return
+		}
 		}
 	} else {
 		// Manual mode - parse form spec
@@ -2606,6 +3185,46 @@ func main() {
 						if *verbose && len(bodyStr) == 0 {
 							fmt.Printf("[DEBUG] Empty body! Status: %d, Content-Length: %s, Content-Encoding: %s\n",
 								resp.StatusCode, resp.Header.Get("Content-Length"), resp.Header.Get("Content-Encoding"))
+						}
+
+						// USER ENUMERATION MODE: Check for differential error patterns
+						if *ffufMode == "users" && *ffufValid != "" && *ffufInvalid != "" {
+							// Like ffuf's -fr flag: filter responses matching invalid pattern
+							if strings.Contains(bodyStr, *ffufInvalid) {
+								// Invalid username - skip it
+								success = false
+							} else if strings.Contains(bodyStr, *ffufValid) {
+								// Valid username found! (even though password is wrong)
+								fmt.Printf("? VALID USER: %s\n", cred.Username)
+								success = true
+							} else {
+								// Neither pattern found - treat as failure
+								success = false
+							}
+
+							// Learn from the result for RL
+							errorType := ErrorAuthFailure
+							if !success {
+								errorType = ErrorNone // Invalid user, not an error
+							}
+							rl.learnWithError(cred.Username, cred.Password, respTime, success, errorType)
+
+							if success {
+								select {
+								case found <- cred:
+									if *stopOnFirst {
+										cancel()
+									}
+								default:
+								}
+							}
+
+							// Skip normal password checking logic in enum mode
+							atomic.AddInt64(&attempts, 1)
+							mu.Lock()
+							processing--
+							mu.Unlock()
+							continue
 						}
 
 						// Enhanced success detection with multiple strategies
