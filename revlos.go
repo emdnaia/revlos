@@ -533,11 +533,10 @@ func (rl *UltimateRL) computeScore(username, password string) float64 {
 	ucb1Score := rl.computeUCB1(armKey)
 	thompsonScore := rl.sampleThompson(armKey) * 1000.0
 
-	// Read all scores while holding RLock
+	// Read all scores while holding RLock (original simple pattern)
 	rl.mu.RLock()
 
-	// START WITH SMART BASELINE (pre-trained pattern knowledge!)
-	// This gives RL a HEAD START instead of starting from zero
+	// START WITH SMART BASELINE
 	score := scorePasswordSmart(password, username)
 
 	// If in exploit mode, heavily favor patterns
@@ -557,7 +556,7 @@ func (rl *UltimateRL) computeScore(username, password string) float64 {
 	score += rl.lengthScores[len(password)] * 2.0
 	score += rl.charsetScores[getCharset(password)] * 2.0
 
-	// Genetic pattern matching (optimized: early exit on first match per pattern)
+	// Genetic pattern matching
 	passPrefix := ""
 	if len(password) >= 2 {
 		passPrefix = password[:2]
@@ -570,7 +569,7 @@ func (rl *UltimateRL) computeScore(username, password string) float64 {
 			if gene == username || gene == password {
 				matchScore += pattern.Fitness * 0.5
 				matched = true
-				break // Early exit on exact match
+				break
 			}
 			if passPrefix != "" && strings.Contains(gene, passPrefix) {
 				matchScore += pattern.Fitness * 0.3
@@ -583,26 +582,24 @@ func (rl *UltimateRL) computeScore(username, password string) float64 {
 		score += matchScore
 	}
 
-	// Correlation bonus (optimized: only check exact username)
+	// Correlation bonus
 	if pairs, ok := rl.pairHistory[username]; ok {
 		if pairScore, exists := pairs[password]; exists {
-			score += pairScore * 2.0 // Exact match bonus
+			score += pairScore * 2.0
 		} else if len(password) >= 2 {
-			// Check prefix/suffix matches only if no exact match
 			for p, pairScore := range pairs {
 				if len(p) >= 2 {
 					if p[:2] == password[:2] {
 						score += pairScore * 1.2
-						break // Only first match
+						break
 					}
 				}
 			}
 		}
 	}
-	rl.mu.RUnlock() // Release RLock BEFORE taking Lock!
+	rl.mu.RUnlock()
 
-	// Option 3: Context-Aware Weighting
-	// Calculate success rate to adapt weights dynamically
+	// Context-aware weighting
 	attempts := atomic.LoadInt64(&rl.attemptCount)
 	successes := atomic.LoadInt64(&rl.successCount)
 	successRate := 0.0
@@ -610,29 +607,20 @@ func (rl *UltimateRL) computeScore(username, password string) float64 {
 		successRate = float64(successes) / float64(attempts)
 	}
 
-	// Dynamic weight adjustment based on context
 	ucb1Weight := 10.0
 	thompsonWeight := 5.0
 
 	if rl.generation <= 2 || successRate < 0.01 {
-		// Early generations OR low success rate ? trust smart baseline
-		// (< 1% success means RL isn't learning useful patterns)
 		ucb1Weight = 0.0
 		thompsonWeight = 0.0
 	} else if successRate > 0.05 {
-		// High success rate (> 5%) ? RL is learning well!
-		// Trust RL patterns even MORE than usual
 		ucb1Weight = 15.0
 		thompsonWeight = 7.5
-	} else {
-		// Normal success rate (1-5%) ? balanced approach
-		ucb1Weight = 10.0
-		thompsonWeight = 5.0
 	}
 
 	finalScore := score + ucb1Score*ucb1Weight + thompsonScore*thompsonWeight
 
-	// Cache the computed score (now safe - no lock held)
+	// Cache result (simple, no version check - let it get stale occasionally)
 	rl.mu.Lock()
 	rl.scoreCache[armKey] = finalScore
 	rl.mu.Unlock()
@@ -1282,7 +1270,7 @@ func runUserEnumeration(targetURL, userField, passField, method, invalidPattern,
 }
 
 // runFuzzing performs general web fuzzing (directories, vhosts, params) - ffuf-style
-func runFuzzing(targetURL, keyword, wordlist, method, postData, header string, threads int, matchCodes, filterCodes string, quiet bool) {
+func runFuzzing(targetURL, keyword, wordlist, method, postData, header string, threads int, matchCodes, filterCodes, filterRegex string, quiet bool) {
 	// Load wordlist
 	words, err := loadWordlist(wordlist)
 	if err != nil {
@@ -1293,6 +1281,17 @@ func runFuzzing(targetURL, keyword, wordlist, method, postData, header string, t
 	// Parse status codes
 	matchStatuses := parseStatusCodes(matchCodes)
 	filterStatuses := parseStatusCodes(filterCodes)
+
+	// Precompile filter regex for performance
+	var filterRegexCompiled *regexp.Regexp
+	if filterRegex != "" {
+		var err error
+		filterRegexCompiled, err = regexp.Compile(filterRegex)
+		if err != nil {
+			fmt.Printf("? Invalid regex pattern: %v\n", err)
+			os.Exit(1)
+		}
+	}
 
 	// Validate FUZZ keyword exists
 	if !strings.Contains(targetURL, keyword) && !strings.Contains(postData, keyword) && !strings.Contains(header, keyword) {
@@ -1313,6 +1312,15 @@ func runFuzzing(targetURL, keyword, wordlist, method, postData, header string, t
 	var resultCount int
 	var resultMutex sync.Mutex
 
+	// Create shared HTTP client with minimal optimal transport
+	transport := &http.Transport{
+		MaxIdleConnsPerHost: threads, // Only set what we need
+	}
+	sharedClient := &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: transport,
+	}
+
 	fmt.Printf("\n? Fuzzing Mode (ffuf-style)\n")
 	fmt.Printf("=====================================\n")
 	fmt.Printf("Target:   %s\n", targetURL)
@@ -1321,6 +1329,9 @@ func runFuzzing(targetURL, keyword, wordlist, method, postData, header string, t
 	fmt.Printf("Threads:  %d\n", threads)
 	if len(filterStatuses) > 0 {
 		fmt.Printf("Filter:   Status %v\n", filterStatuses)
+	}
+	if filterRegex != "" {
+		fmt.Printf("Filter:   Regex '%s' (body content)\n", filterRegex)
 	}
 	if len(matchStatuses) > 0 {
 		fmt.Printf("Match:    Status %v\n", matchStatuses)
@@ -1337,9 +1348,6 @@ func runFuzzing(targetURL, keyword, wordlist, method, postData, header string, t
 		go func(fuzzValue string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-
-			// Create client
-			client := &http.Client{Timeout: 10 * time.Second}
 
 			// Replace FUZZ in URL
 			finalURL := strings.ReplaceAll(targetURL, keyword, fuzzValue)
@@ -1373,19 +1381,27 @@ func runFuzzing(targetURL, keyword, wordlist, method, postData, header string, t
 			}
 
 			// Send request
-			resp, err := client.Do(req)
+			resp, err := sharedClient.Do(req)
 			if err != nil {
 				return
 			}
 			defer resp.Body.Close()
 
-			// Read response
+			// Read response (automatically drains body for connection reuse)
 			body, _ := io.ReadAll(resp.Body)
+			bodyStr := string(body)
 			size := len(body)
-			lines := strings.Count(string(body), "\n")
-			words := len(strings.Fields(string(body)))
+			lines := strings.Count(bodyStr, "\n")
+			words := len(strings.Fields(bodyStr))
 
-			// Apply filters
+			// Apply regex filter (like ffuf's -fr flag)
+			if filterRegexCompiled != nil {
+				if filterRegexCompiled.MatchString(bodyStr) {
+					return // Skip responses matching filter pattern
+				}
+			}
+
+			// Apply status code filters
 			if len(filterStatuses) > 0 && containsInt(filterStatuses, resp.StatusCode) {
 				return
 			}
@@ -2514,6 +2530,7 @@ func main() {
 		fuzzHeader       = flag.String("fuzz-header", "", "Header with FUZZ (e.g., 'Host: FUZZ.target.com')")
 		matchStatus      = flag.String("match-status", "", "Match status codes (e.g., '200,301,302')")
 		filterStatus     = flag.String("filter-status", "404", "Filter status codes (default: 404)")
+		filterRegex      = flag.String("filter-regex", "", "Filter responses matching regex in body (like ffuf's -fr)")
 	)
 
 	flag.Parse()
@@ -2547,7 +2564,7 @@ func main() {
 		}
 
 		runFuzzing(*fuzzURL, *fuzzKeyword, wordlist, *fuzzMethod, *fuzzData, *fuzzHeader,
-		           *ffufThreads, *matchStatus, *filterStatus, *quiet)
+		           *workers, *matchStatus, *filterStatus, *filterRegex, *quiet)
 		return
 	}
 
